@@ -16,6 +16,7 @@ from fmc.canonical import CanonicalPortMapper
 from analysis.service_mapper import ServiceMapper
 from analysis.app_mapper import ApplicationMapper
 from migration.planner import MigrationPlanner
+from migration.executor import MigrationExecutor
 
 
 def main():
@@ -203,17 +204,16 @@ def run_migration(config: MigrationConfig) -> bool:
         print("Review the migration plan and run with --execute to proceed.")
         return True
     
-    # Step 9: Execute migration (if not dry run)
+    # Step 9: Execute migration
     print("\n" + "="*60)
     print("STEP 8: EXECUTING MIGRATION")
     print("="*60)
     print("\n⚠  This will create objects in FMC")
     
-    # TODO: Implement object creation and policy migration
-    print("\n✗ Execution not yet implemented in this version")
-    print("  This is a dry-run only preview")
+    executor = MigrationExecutor(fmc_client, plan)
+    success = executor.execute(config.new_acp_name)
     
-    return True
+    return success
 
 
 def save_migration_plan(plan, filename: str):
