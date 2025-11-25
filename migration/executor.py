@@ -3,6 +3,7 @@ Migration executor - creates objects and policies in FMC.
 """
 
 import time
+import re
 from typing import Dict, List, Any, Optional
 from models import (
     MigrationPlan, WatchGuardAddress, WatchGuardService, 
@@ -20,6 +21,56 @@ class MigrationExecutor:
         self.created_objects: Dict[str, FMCObject] = {}
         self.execution_log: List[str] = []
         self.errors: List[str] = []
+        self.name_map: Dict[str, str] = {}  # original_name -> sanitized_name
+        self.used_names: set = set()  # Track used names to avoid collisions
+    
+    def _sanitize_name(self, name: str) -> str:
+        """
+        Sanitize object name to be FMC-compliant.
+        
+        FMC object names cannot contain: : ? * < > | / \\ or spaces
+        and must be <= 50 characters.
+        """
+        # Check if already sanitized
+        if name in self.name_map:
+            return self.name_map[name]
+        
+        # Remove/replace invalid characters
+        sanitized = name
+        
+        # Replace colons, question marks, asterisks, spaces, etc. with underscores
+        invalid_chars = r'[:?*<>|/\\\s]'
+        sanitized = re.sub(invalid_chars, '_', sanitized)
+        
+        # Remove leading/trailing underscores
+        sanitized = sanitized.strip('_')
+        
+        # Collapse multiple consecutive underscores into one
+        sanitized = re.sub(r'_+', '_', sanitized)
+        
+        # Limit to 50 characters
+        if len(sanitized) > 50:
+            sanitized = sanitized[:50].rstrip('_')
+        
+        # Handle empty names
+        if not sanitized:
+            sanitized = "unnamed_object"
+        
+        # Handle name collisions by appending number
+        original_sanitized = sanitized
+        counter = 1
+        while sanitized in self.used_names:
+            # Add counter, keeping total length <= 50
+            suffix = f"_{counter}"
+            max_base_len = 50 - len(suffix)
+            sanitized = original_sanitized[:max_base_len] + suffix
+            counter += 1
+        
+        # Store mapping and mark as used
+        self.name_map[name] = sanitized
+        self.used_names.add(sanitized)
+        
+        return sanitized
     
     def execute(self, acp_name: str) -> bool:
         """Execute the migration plan."""
@@ -113,11 +164,14 @@ class MigrationExecutor:
         """Build FMC API data for a network object."""
         obj_type = wg_obj.object_type
         
+        # Sanitize the name
+        sanitized_name = self._sanitize_name(wg_obj.name)
+        
         if obj_type == 'host':
             return {
                 'fmc_type': 'hosts',
                 'data': {
-                    'name': wg_obj.name[:50],  # FMC name limit
+                    'name': sanitized_name,
                     'type': 'Host',
                     'value': wg_obj.ip,
                     'description': wg_obj.description[:200] if wg_obj.description else ''
@@ -128,7 +182,7 @@ class MigrationExecutor:
             return {
                 'fmc_type': 'networks',
                 'data': {
-                    'name': wg_obj.name[:50],
+                    'name': sanitized_name,
                     'type': 'Network',
                     'value': f"{wg_obj.network}/{wg_obj.mask}",
                     'description': wg_obj.description[:200] if wg_obj.description else ''
@@ -139,7 +193,7 @@ class MigrationExecutor:
             return {
                 'fmc_type': 'ranges',
                 'data': {
-                    'name': wg_obj.name[:50],
+                    'name': sanitized_name,
                     'type': 'Range',
                     'value': f"{wg_obj.start}-{wg_obj.end}",
                     'description': wg_obj.description[:200] if wg_obj.description else ''
@@ -150,7 +204,7 @@ class MigrationExecutor:
             return {
                 'fmc_type': 'fqdns',
                 'data': {
-                    'name': wg_obj.name[:50],
+                    'name': sanitized_name,
                     'type': 'FQDN',
                     'value': wg_obj.fqdn,
                     'dnsResolution': 'IPV4_ONLY',
@@ -212,11 +266,14 @@ class MigrationExecutor:
     
     def _build_service_object_data(self, wg_svc: WatchGuardService) -> Optional[Dict]:
         """Build FMC API data for a service object."""
+        # Sanitize the name
+        sanitized_name = self._sanitize_name(wg_svc.name)
+        
         if wg_svc.protocol in ['TCP', 'UDP']:
             return {
                 'fmc_type': 'protocolportobjects',
                 'data': {
-                    'name': wg_svc.name[:50],
+                    'name': sanitized_name,
                     'type': 'ProtocolPortObject',
                     'protocol': wg_svc.protocol,
                     'port': wg_svc.port,
@@ -229,7 +286,7 @@ class MigrationExecutor:
             return {
                 'fmc_type': 'icmpv4objects',
                 'data': {
-                    'name': wg_svc.name[:50],
+                    'name': sanitized_name,
                     'type': 'ICMPV4Object',
                     'icmpType': 'ANY',
                     'description': wg_svc.description[:200] if wg_svc.description else ''
@@ -288,6 +345,9 @@ class MigrationExecutor:
     
     def _build_network_group_data(self, wg_group: WatchGuardAddressGroup) -> Optional[Dict]:
         """Build FMC API data for a network group."""
+        # Sanitize the name
+        sanitized_name = self._sanitize_name(wg_group.name)
+        
         # Resolve member references to FMC objects
         objects = []
         
@@ -313,7 +373,7 @@ class MigrationExecutor:
             return None
         
         return {
-            'name': wg_group.name[:50],
+            'name': sanitized_name,
             'type': 'NetworkGroup',
             'objects': objects,
             'description': wg_group.description[:200] if wg_group.description else ''
@@ -386,6 +446,18 @@ class MigrationExecutor:
         
         print(f"\nObjects Created: {len(self.created_objects)}")
         print(f"Errors: {len(self.errors)}")
+        
+        # Print name sanitization stats
+        sanitized_count = len(self.name_map)
+        if sanitized_count > 0:
+            print(f"\nName Sanitization:")
+            print(f"  Names sanitized: {sanitized_count}")
+            
+            # Show a few examples
+            print(f"  Examples (first 5):")
+            for i, (original, sanitized) in enumerate(list(self.name_map.items())[:5]):
+                if original != sanitized:
+                    print(f"    '{original}' → '{sanitized}'")
         
         if self.errors:
             print("\nErrors (first 20):")
