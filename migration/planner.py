@@ -3,7 +3,7 @@ Migration Planner - Creates migration plan with proper alias resolution.
 """
 
 from typing import Dict, List, Set, Any, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 import json
 from models import (
     WatchGuardConfig, WatchGuardPolicy, WatchGuardAddress, 
@@ -155,6 +155,38 @@ class MigrationPlanner:
         
         return list(set(resolved))
     
+    def _get_app_mappings(self) -> Dict[str, FMCObject]:
+        """Get application mappings from app_mapper, handling different attribute names."""
+        # Try different attribute names
+        if hasattr(self.app_mapper, 'app_mappings'):
+            return self.app_mapper.app_mappings
+        elif hasattr(self.app_mapper, 'mappings'):
+            return self.app_mapper.mappings
+        elif hasattr(self.app_mapper, 'application_mappings'):
+            return self.app_mapper.application_mappings
+        else:
+            print("  ⚠ Warning: ApplicationMapper has no mappings attribute")
+            # Try to find any dict attribute that might be mappings
+            for attr in dir(self.app_mapper):
+                if not attr.startswith('_'):
+                    val = getattr(self.app_mapper, attr)
+                    if isinstance(val, dict) and len(val) > 0:
+                        first_val = next(iter(val.values()), None)
+                        if hasattr(first_val, 'id') and hasattr(first_val, 'name'):
+                            print(f"  → Found mappings in '{attr}' attribute")
+                            return val
+            return {}
+    
+    def _get_service_mappings(self) -> Dict[str, FMCObject]:
+        """Get service mappings from service_mapper, handling different attribute names."""
+        if hasattr(self.service_mapper, 'service_mappings'):
+            return self.service_mapper.service_mappings
+        elif hasattr(self.service_mapper, 'mappings'):
+            return self.service_mapper.mappings
+        else:
+            print("  ⚠ Warning: ServiceMapper has no mappings attribute")
+            return {}
+    
     def build_plan(self) -> MigrationPlan:
         """Build migration plan."""
         print("\n" + "="*60)
@@ -163,23 +195,12 @@ class MigrationPlanner:
         
         address_mappings = {}
         
-        # Service mappings - handle different attribute names
-        if hasattr(self.service_mapper, 'service_mappings'):
-            service_mappings = self.service_mapper.service_mappings
-        elif hasattr(self.service_mapper, 'mappings'):
-            service_mappings = self.service_mapper.mappings
-        else:
-            service_mappings = {}
-            print("  ⚠ Warning: ServiceMapper has no mappings attribute")
+        # Get mappings using helper methods
+        service_mappings = self._get_service_mappings()
+        application_mappings = self._get_app_mappings()
         
-        # Application mappings - handle different attribute names
-        if hasattr(self.app_mapper, 'mappings'):
-            application_mappings = self.app_mapper.mappings
-        elif hasattr(self.app_mapper, 'application_mappings'):
-            application_mappings = self.app_mapper.application_mappings
-        else:
-            application_mappings = {}
-            print("  ⚠ Warning: ApplicationMapper has no mappings attribute")
+        print(f"\n  Service mappings found: {len(service_mappings)}")
+        print(f"  Application mappings found: {len(application_mappings)}")
         
         objects_to_create = []
         policies_to_create = []
@@ -192,8 +213,6 @@ class MigrationPlanner:
         for name, obj in self.services.items():
             if name not in service_mappings:
                 objects_to_create.append({'type': 'service', 'wg_object': obj})
-        
-        print("\nMapping applications...")
         
         print("\nProcessing URL objects...")
         for url_obj in self.url_objects:
@@ -275,7 +294,7 @@ class MigrationPlanner:
                         'name': name
                     })
         
-        # Services
+        # Services - need to include FMC object ID for mapped services
         service_objects = []
         if policy.service and policy.service != 'Any':
             if policy.service in service_mappings:
@@ -283,20 +302,21 @@ class MigrationPlanner:
                 service_objects.append({
                     'type': obj.type,
                     'id': obj.id,
-                    'name': obj.name,
-                    'protocol': getattr(obj, 'protocol', None),
-                    'port': getattr(obj, 'port', None)
+                    'name': obj.name
                 })
             elif policy.service in self.services:
                 wg_svc = self.services[policy.service]
+                # This service will need to be created - flag it
+                warnings.append(f"Service '{policy.service}' needs to be created")
                 service_objects.append({
                     'type': 'ProtocolPortObject',
                     'name': policy.service,
                     'protocol': wg_svc.protocol,
-                    'port': wg_svc.port
+                    'port': wg_svc.port,
+                    'needs_creation': True
                 })
             else:
-                warnings.append(f"Service '{policy.service}' not found")
+                warnings.append(f"Service '{policy.service}' not found in WatchGuard config or FMC")
         
         # Check issues
         if not source_objects and policy.source_members and policy.source_members != ['Any']:
@@ -307,27 +327,47 @@ class MigrationPlanner:
         # Build FMC rule
         fmc_rule = {
             'name': policy.name[:50],
-            'action': policy.action.upper(),
+            'action': self._map_action(policy.action),
             'enabled': policy.enabled,
             'sendEventsToFMC': policy.log_enabled,
             'logBegin': False,
             'logEnd': policy.log_enabled
         }
         
+        # Only add network objects if we have valid IDs
+        # NOTE: We need to look up the IDs after objects are created
+        # For now, store the names and types for later resolution
         if source_objects:
             fmc_rule['sourceNetworks'] = {'objects': source_objects}
         if dest_objects:
             fmc_rule['destinationNetworks'] = {'objects': dest_objects}
         if service_objects:
-            fmc_rule['destinationPorts'] = {'objects': service_objects}
+            # Only include services that have IDs (already exist in FMC)
+            valid_services = [s for s in service_objects if 'id' in s and not s.get('needs_creation')]
+            if valid_services:
+                fmc_rule['destinationPorts'] = {'objects': valid_services}
         
         return {
             'wg_policy': policy.name,
             'fmc_rule': fmc_rule,
             'issues': issues,
             'warnings': warnings,
-            'errors': issues
+            'errors': issues,
+            'source_members_original': policy.source_members,
+            'dest_members_original': policy.destination_members,
+            'service_original': policy.service
         }, issues
+    
+    def _map_action(self, wg_action: str) -> str:
+        """Map WatchGuard action to FMC action."""
+        action_map = {
+            'allow': 'ALLOW',
+            'deny': 'BLOCK',
+            'drop': 'BLOCK',
+            'proxy': 'ALLOW',  # Proxy rules become allow
+            'block': 'BLOCK'
+        }
+        return action_map.get(wg_action.lower(), 'ALLOW')
     
     def _get_fmc_type(self, wg_type: str) -> str:
         """Convert WatchGuard type to FMC type."""
