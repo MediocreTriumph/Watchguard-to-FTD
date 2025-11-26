@@ -49,6 +49,11 @@ class MigrationPlan:
     @property
     def policies_with_errors(self):
         return self.statistics.get('policies_with_errors', 0)
+    
+    @property
+    def app_mappings(self):
+        """Alias for application_mappings for CLI compatibility."""
+        return self.application_mappings
 
 
 class MigrationPlanner:
