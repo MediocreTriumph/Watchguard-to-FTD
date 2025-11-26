@@ -210,7 +210,8 @@ def run_migration(config: MigrationConfig) -> bool:
     print("="*60)
     print("\n⚠  This will create objects in FMC")
     
-    executor = MigrationExecutor(fmc_client, plan)
+    # Pass fmc_objects to executor for ID resolution
+    executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects)
     success = executor.execute(config.new_acp_name)
     
     return success
