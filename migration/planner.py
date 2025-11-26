@@ -157,7 +157,6 @@ class MigrationPlanner:
     
     def _get_app_mappings(self) -> Dict[str, FMCObject]:
         """Get application mappings from app_mapper, handling different attribute names."""
-        # Try different attribute names
         if hasattr(self.app_mapper, 'app_mappings'):
             return self.app_mapper.app_mappings
         elif hasattr(self.app_mapper, 'mappings'):
@@ -165,15 +164,14 @@ class MigrationPlanner:
         elif hasattr(self.app_mapper, 'application_mappings'):
             return self.app_mapper.application_mappings
         else:
-            print("  ⚠ Warning: ApplicationMapper has no mappings attribute")
-            # Try to find any dict attribute that might be mappings
+            print("  Warning: ApplicationMapper has no mappings attribute")
             for attr in dir(self.app_mapper):
                 if not attr.startswith('_'):
                     val = getattr(self.app_mapper, attr)
                     if isinstance(val, dict) and len(val) > 0:
                         first_val = next(iter(val.values()), None)
                         if hasattr(first_val, 'id') and hasattr(first_val, 'name'):
-                            print(f"  → Found mappings in '{attr}' attribute")
+                            print(f"  Found mappings in '{attr}' attribute")
                             return val
             return {}
     
@@ -184,7 +182,7 @@ class MigrationPlanner:
         elif hasattr(self.service_mapper, 'mappings'):
             return self.service_mapper.mappings
         else:
-            print("  ⚠ Warning: ServiceMapper has no mappings attribute")
+            print("  Warning: ServiceMapper has no mappings attribute")
             return {}
     
     def build_plan(self) -> MigrationPlan:
@@ -195,7 +193,6 @@ class MigrationPlanner:
         
         address_mappings = {}
         
-        # Get mappings using helper methods
         service_mappings = self._get_service_mappings()
         application_mappings = self._get_app_mappings()
         
@@ -267,9 +264,6 @@ class MigrationPlanner:
         issues = []
         warnings = []
         
-        # WatchGuardPolicy only has source_members and destination_members
-        # These can be either direct objects OR aliases - we resolve both
-        
         # Resolve sources
         source_objects = []
         for member in policy.source_members:
@@ -294,7 +288,7 @@ class MigrationPlanner:
                         'name': name
                     })
         
-        # Services - need to include FMC object ID for mapped services
+        # Services
         service_objects = []
         if policy.service and policy.service != 'Any':
             if policy.service in service_mappings:
@@ -306,7 +300,6 @@ class MigrationPlanner:
                 })
             elif policy.service in self.services:
                 wg_svc = self.services[policy.service]
-                # This service will need to be created - flag it
                 warnings.append(f"Service '{policy.service}' needs to be created")
                 service_objects.append({
                     'type': 'ProtocolPortObject',
@@ -316,7 +309,7 @@ class MigrationPlanner:
                     'needs_creation': True
                 })
             else:
-                warnings.append(f"Service '{policy.service}' not found in WatchGuard config or FMC")
+                warnings.append(f"Service '{policy.service}' not found")
         
         # Check issues
         if not source_objects and policy.source_members and policy.source_members != ['Any']:
@@ -324,25 +317,38 @@ class MigrationPlanner:
         if not dest_objects and policy.destination_members and policy.destination_members != ['Any']:
             issues.append(f"No destination objects resolved from: {policy.destination_members}")
         
+        # Warn if rule has too many objects (FMC limit is 200 per field)
+        if len(source_objects) > 200:
+            warnings.append(f"Rule has {len(source_objects)} source objects (FMC limit is 200)")
+        if len(dest_objects) > 200:
+            warnings.append(f"Rule has {len(dest_objects)} destination objects (FMC limit is 200)")
+        
         # Build FMC rule
+        action = self._map_action(policy.action)
+        
+        # FMC does not support logEnd for BLOCK actions
+        # For BLOCK rules, use logBegin instead if logging is enabled
+        if action == 'BLOCK':
+            log_begin = policy.log_enabled
+            log_end = False
+        else:
+            log_begin = False
+            log_end = policy.log_enabled
+        
         fmc_rule = {
             'name': policy.name[:50],
-            'action': self._map_action(policy.action),
+            'action': action,
             'enabled': policy.enabled,
             'sendEventsToFMC': policy.log_enabled,
-            'logBegin': False,
-            'logEnd': policy.log_enabled
+            'logBegin': log_begin,
+            'logEnd': log_end
         }
         
-        # Only add network objects if we have valid IDs
-        # NOTE: We need to look up the IDs after objects are created
-        # For now, store the names and types for later resolution
         if source_objects:
             fmc_rule['sourceNetworks'] = {'objects': source_objects}
         if dest_objects:
             fmc_rule['destinationNetworks'] = {'objects': dest_objects}
         if service_objects:
-            # Only include services that have IDs (already exist in FMC)
             valid_services = [s for s in service_objects if 'id' in s and not s.get('needs_creation')]
             if valid_services:
                 fmc_rule['destinationPorts'] = {'objects': valid_services}
@@ -364,7 +370,7 @@ class MigrationPlanner:
             'allow': 'ALLOW',
             'deny': 'BLOCK',
             'drop': 'BLOCK',
-            'proxy': 'ALLOW',  # Proxy rules become allow
+            'proxy': 'ALLOW',
             'block': 'BLOCK'
         }
         return action_map.get(wg_action.lower(), 'ALLOW')
