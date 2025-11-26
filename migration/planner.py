@@ -1,30 +1,115 @@
 """
-Migration planner - builds complete migration plan.
+Migration Planner - Creates migration plan with proper alias resolution.
+
+This module:
+1. Maps WatchGuard objects to FMC objects
+2. Resolves aliases recursively to actual network objects
+3. Creates FMC rules with proper source/destination objects
+4. Handles service groups and deduplication
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Set, Any, Optional
+from dataclasses import dataclass, asdict
+import json
 from models import (
-    WatchGuardConfig, FMCObjects, FMCObject, MigrationPlan,
-    WatchGuardPolicy, WatchGuardAddress, WatchGuardService
+    WatchGuardConfig, WatchGuardPolicy, WatchGuardAddress, 
+    WatchGuardAddressGroup, WatchGuardService, FMCObject
 )
+from fmc.discovery import FMCObjectDiscovery
 from analysis.service_mapper import ServiceMapper
 from analysis.app_mapper import ApplicationMapper
 
 
+@dataclass
+class MigrationPlan:
+    """Complete migration plan."""
+    address_mappings: Dict[str, FMCObject]
+    service_mappings: Dict[str, FMCObject]
+    application_mappings: Dict[str, FMCObject]
+    objects_to_create: List[Dict]
+    policies_to_create: List[Dict]
+    statistics: Dict[str, int]
+
+
 class MigrationPlanner:
-    """Builds complete migration plan mapping all WG objects to FMC."""
+    """Plans migration from WatchGuard to FMC."""
     
-    def __init__(
-        self,
-        wg_config: WatchGuardConfig,
-        fmc_objects: FMCObjects,
-        service_mapper: ServiceMapper,
-        app_mapper: ApplicationMapper
-    ):
+    def __init__(self, wg_config: WatchGuardConfig, fmc_discovery: FMCObjectDiscovery,
+                 service_mapper: ServiceMapper, app_mapper: ApplicationMapper):
         self.wg_config = wg_config
-        self.fmc_objects = fmc_objects
+        self.fmc_discovery = fmc_discovery
         self.service_mapper = service_mapper
         self.app_mapper = app_mapper
+        
+        # Build lookup structures
+        self._build_lookups()
+    
+    def _build_lookups(self):
+        """Build lookup structures for quick access."""
+        # Address objects by name
+        self.address_objects = {}
+        for host in self.wg_config.hosts:
+            self.address_objects[host.name] = host
+        for network in self.wg_config.networks:
+            self.address_objects[network.name] = network
+        for range_obj in self.wg_config.ranges:
+            self.address_objects[range_obj.name] = range_obj
+        for fqdn in self.wg_config.fqdns:
+            self.address_objects[fqdn.name] = fqdn
+        
+        # Address groups by name
+        self.address_groups = {group.name: group for group in self.wg_config.address_groups}
+        
+        # Services by name
+        self.services = {}
+        for tcp_svc in self.wg_config.tcp_services:
+            self.services[tcp_svc.name] = tcp_svc
+        for udp_svc in self.wg_config.udp_services:
+            self.services[udp_svc.name] = udp_svc
+    
+    def resolve_alias_to_objects(self, alias_name: str, visited: Optional[Set[str]] = None) -> List[str]:
+        """
+        Recursively resolve an alias to actual address object names.
+        
+        Args:
+            alias_name: Name of alias to resolve
+            visited: Set of already visited aliases (prevents circular references)
+            
+        Returns:
+            List of address object names
+        """
+        if visited is None:
+            visited = set()
+        
+        # Prevent circular references
+        if alias_name in visited:
+            return []
+        visited.add(alias_name)
+        
+        # Special cases
+        if alias_name in ["Any", "Any-External", "Any-Trusted", "Any-Optional"]:
+            return []  # These are interface aliases, not address objects
+        
+        # Check if it's an address group
+        if alias_name not in self.address_groups:
+            # It might be a direct address object
+            if alias_name in self.address_objects:
+                return [alias_name]
+            return []
+        
+        group = self.address_groups[alias_name]
+        resolved = []
+        
+        # Resolve direct members
+        for member in group.members:
+            if member in self.address_objects:
+                resolved.append(member)
+        
+        # Resolve alias references recursively
+        for alias_ref in group.alias_references:
+            resolved.extend(self.resolve_alias_to_objects(alias_ref, visited))
+        
+        return list(set(resolved))  # Remove duplicates
     
     def build_plan(self) -> MigrationPlan:
         """Build complete migration plan."""
@@ -32,273 +117,273 @@ class MigrationPlanner:
         print("BUILDING MIGRATION PLAN")
         print("="*60)
         
-        plan = MigrationPlan()
+        # Initialize mappings
+        address_mappings = {}
+        service_mappings = {}
+        application_mappings = {}
+        objects_to_create = []
+        policies_to_create = []
         
-        # Map address objects
+        # Map addresses
         print("\nMapping address objects...")
-        self._map_addresses(plan)
-        
-        # Map services (already done by service_mapper)
-        print("\nMapping services...")
-        plan.service_mappings = self.service_mapper.service_mappings.copy()
-        
-        # Map applications (already done by app_mapper)
-        print("\nMapping applications...")
-        plan.app_mappings = self.app_mapper.app_mappings.copy()
-        
-        # Identify objects that need creation
-        print("\nIdentifying objects to create...")
-        self._identify_objects_to_create(plan)
-        
-        # Build policy migration plan
-        print("\nPlanning policy migration...")
-        self._plan_policies(plan)
-        
-        # Calculate statistics
-        self._calculate_statistics(plan)
-        
-        # Print summary
-        self._print_summary(plan)
-        
-        return plan
-    
-    def _map_addresses(self, plan: MigrationPlan):
-        """Map address objects to existing FMC objects or mark for creation."""
-        # For now, we'll assume all addresses need to be created
-        # In a more sophisticated version, we could try to match by IP/network value
-        
-        all_addresses = (
-            self.wg_config.hosts +
-            self.wg_config.networks +
-            self.wg_config.ranges +
-            [fqdn for fqdn in self.wg_config.fqdns if not fqdn.is_wildcard_fqdn]
-        )
-        
-        for addr in all_addresses:
-            # Check if exists in FMC by name
-            existing = self.fmc_objects.get_by_name(addr.name, addr.object_type)
-            
-            if existing:
-                plan.address_mappings[addr.name] = existing
+        mapped_count = 0
+        for name, obj in self.address_objects.items():
+            # Check if exists in FMC
+            fmc_obj = self._find_fmc_address_object(obj)
+            if fmc_obj:
+                address_mappings[name] = fmc_obj
+                mapped_count += 1
             else:
-                # Will need to create
-                pass
-        
-        print(f"  Mapped to existing: {len(plan.address_mappings)}")
-    
-    def _identify_objects_to_create(self, plan: MigrationPlan):
-        """Identify which objects need to be created."""
-        # Addresses that need creation
-        all_addresses = (
-            self.wg_config.hosts +
-            self.wg_config.networks +
-            self.wg_config.ranges +
-            [fqdn for fqdn in self.wg_config.fqdns if not fqdn.is_wildcard_fqdn]
-        )
-        
-        for addr in all_addresses:
-            if addr.name not in plan.address_mappings:
-                plan.objects_to_create.append({
-                    'type': addr.object_type,
-                    'wg_object': addr
+                # Need to create
+                objects_to_create.append({
+                    'type': obj.object_type,
+                    'wg_object': obj
                 })
         
-        # Services that need creation (unmapped ones)
-        for service_name, wg_service in self.service_mapper.unmapped_services.items():
-            plan.objects_to_create.append({
-                'type': 'service',
-                'wg_object': wg_service
+        print(f"  Mapped to existing: {mapped_count}")
+        
+        # Map services
+        print("\nMapping services...")
+        for name, obj in self.services.items():
+            canonical = self.service_mapper.service_mappings.get(name)
+            if canonical:
+                service_mappings[name] = canonical
+            else:
+                # Need to create
+                objects_to_create.append({
+                    'type': 'service',
+                    'wg_object': obj
+                })
+        
+        # Map applications
+        print("\nMapping applications...")
+        for app_name, fmc_app in self.app_mapper.application_mappings.items():
+            application_mappings[app_name] = fmc_app
+        
+        # Identify objects to create
+        print("\nIdentifying objects to create...")
+        print(f"  Objects to create: {len(objects_to_create)}")
+        
+        # Build address groups
+        for group in self.wg_config.address_groups:
+            objects_to_create.append({
+                'type': 'address_group',
+                'wg_object': group
             })
         
-        # Address groups (always create - FMC doesn't let us easily match these)
-        for group in self.wg_config.address_groups:
-            if not group.is_interface_alias:
-                plan.objects_to_create.append({
-                    'type': 'address_group',
-                    'wg_object': group
-                })
-        
-        print(f"  Objects to create: {len(plan.objects_to_create)}")
-    
-    def _plan_policies(self, plan: MigrationPlan):
-        """Plan policy migration with resolved object references."""
+        # Plan policy migration
+        print("\nPlanning policy migration...")
+        total_policies = len(self.wg_config.policies)
         policies_with_issues = 0
         
-        for wg_policy in self.wg_config.policies:
-            policy_data = self._build_policy_data(wg_policy, plan)
+        for policy in self.wg_config.policies:
+            policy_plan, issues = self._plan_policy(policy, address_mappings, service_mappings, application_mappings)
             
-            if 'errors' in policy_data and policy_data['errors']:
+            if issues:
                 policies_with_issues += 1
             
-            plan.policies_to_create.append(policy_data)
+            policies_to_create.append(policy_plan)
         
-        print(f"  Total policies: {len(plan.policies_to_create)}")
+        print(f"  Total policies: {total_policies}")
         print(f"  With issues: {policies_with_issues}")
-    
-    def _build_policy_data(self, wg_policy: WatchGuardPolicy, plan: MigrationPlan) -> Dict[str, Any]:
-        """Build FMC policy data from WatchGuard policy."""
-        policy_data = {
-            'wg_policy': wg_policy,
-            'fmc_rule': {},
-            'warnings': [],
-            'errors': []
+        
+        # Build statistics
+        statistics = {
+            'total_wg_objects': len(self.address_objects),
+            'mapped_to_existing': mapped_count,
+            'needs_creation': len(objects_to_create),
+            'unmapped': len(self.address_objects) - mapped_count - len([o for o in objects_to_create if o['type'] != 'address_group']),
+            'total_policies': total_policies,
+            'policies_with_issues': policies_with_issues
         }
         
-        # Basic policy info
-        policy_data['fmc_rule']['name'] = wg_policy.name[:50]  # FMC limit
-        policy_data['fmc_rule']['type'] = 'AccessRule'
-        policy_data['fmc_rule']['enabled'] = wg_policy.enabled
+        return MigrationPlan(
+            address_mappings=address_mappings,
+            service_mappings=service_mappings,
+            application_mappings=application_mappings,
+            objects_to_create=objects_to_create,
+            policies_to_create=policies_to_create,
+            statistics=statistics
+        )
+    
+    def _find_fmc_address_object(self, wg_obj: WatchGuardAddress) -> Optional[FMCObject]:
+        """Find matching FMC object for a WatchGuard address."""
+        # Simple name matching for now
+        # Could be enhanced with value matching
+        return None  # Force creation for now
+    
+    def _plan_policy(self, policy: WatchGuardPolicy, address_mappings: Dict, 
+                     service_mappings: Dict, application_mappings: Dict) -> tuple:
+        """
+        Plan migration for a single policy with proper alias resolution.
         
-        # Action
-        action_map = {
-            'Allow': 'ALLOW',
-            'Deny': 'BLOCK',
-            'Drop': 'BLOCK',
-            'Proxy': 'ALLOW'  # Proxy policies become Allow with note
+        Returns:
+            Tuple of (policy_plan, issues_list)
+        """
+        issues = []
+        warnings = []
+        
+        # Resolve source aliases to actual objects
+        source_objects = []
+        for alias in policy.source_aliases:
+            resolved_names = self.resolve_alias_to_objects(alias)
+            for name in resolved_names:
+                if name in address_mappings:
+                    obj = address_mappings[name]
+                    source_objects.append({
+                        'type': obj.type,
+                        'id': obj.id,
+                        'name': obj.name
+                    })
+                elif name in self.address_objects:
+                    # Object will be created
+                    wg_obj = self.address_objects[name]
+                    source_objects.append({
+                        'type': self._get_fmc_type(wg_obj.object_type),
+                        'name': name,
+                        'will_be_created': True
+                    })
+        
+        # Add direct source members
+        for member in policy.source_members:
+            resolved_names = self.resolve_alias_to_objects(member)
+            for name in resolved_names:
+                if name in address_mappings:
+                    obj = address_mappings[name]
+                    source_objects.append({
+                        'type': obj.type,
+                        'id': obj.id,
+                        'name': obj.name
+                    })
+                elif name in self.address_objects:
+                    wg_obj = self.address_objects[name]
+                    source_objects.append({
+                        'type': self._get_fmc_type(wg_obj.object_type),
+                        'name': name,
+                        'will_be_created': True
+                    })
+        
+        # Resolve destination aliases
+        dest_objects = []
+        for alias in policy.destination_aliases:
+            resolved_names = self.resolve_alias_to_objects(alias)
+            for name in resolved_names:
+                if name in address_mappings:
+                    obj = address_mappings[name]
+                    dest_objects.append({
+                        'type': obj.type,
+                        'id': obj.id,
+                        'name': obj.name
+                    })
+                elif name in self.address_objects:
+                    wg_obj = self.address_objects[name]
+                    dest_objects.append({
+                        'type': self._get_fmc_type(wg_obj.object_type),
+                        'name': name,
+                        'will_be_created': True
+                    })
+        
+        # Add direct destination members
+        for member in policy.destination_members:
+            resolved_names = self.resolve_alias_to_objects(member)
+            for name in resolved_names:
+                if name in address_mappings:
+                    obj = address_mappings[name]
+                    dest_objects.append({
+                        'type': obj.type,
+                        'id': obj.id,
+                        'name': obj.name
+                    })
+                elif name in self.address_objects:
+                    wg_obj = self.address_objects[name]
+                    dest_objects.append({
+                        'type': self._get_fmc_type(wg_obj.object_type),
+                        'name': name,
+                        'will_be_created': True
+                    })
+        
+        # Resolve services
+        service_objects = []
+        if policy.service in service_mappings:
+            obj = service_mappings[policy.service]
+            service_objects.append({
+                'type': obj.type,
+                'id': obj.id,
+                'name': obj.name,
+                'protocol': obj.protocol,
+                'port': obj.port
+            })
+        elif policy.service in self.services:
+            wg_svc = self.services[policy.service]
+            service_objects.append({
+                'type': 'ProtocolPortObject',
+                'name': policy.service,
+                'protocol': wg_svc.protocol,
+                'port': wg_svc.port,
+                'will_be_created': True
+            })
+        else:
+            issues.append(f"Service '{policy.service}' not found")
+        
+        # Check for issues
+        if not source_objects and (policy.source_aliases or policy.source_members):
+            issues.append("No source objects resolved")
+        if not dest_objects and (policy.destination_aliases or policy.destination_members):
+            issues.append("No destination objects resolved")
+        
+        # Build FMC rule
+        fmc_rule = {
+            'name': policy.name[:50],  # FMC 50 char limit
+            'action': policy.action.upper(),
+            'enabled': policy.enabled,
+            'sendEventsToFMC': policy.log_enabled,
+            'logBegin': False,
+            'logEnd': policy.log_enabled
         }
-        policy_data['fmc_rule']['action'] = action_map.get(wg_policy.action, 'BLOCK')
         
-        # Logging
-        policy_data['fmc_rule']['sendEventsToFMC'] = wg_policy.log_enabled
-        policy_data['fmc_rule']['logBegin'] = False
-        policy_data['fmc_rule']['logEnd'] = wg_policy.log_enabled
+        # Add source networks
+        if source_objects:
+            fmc_rule['sourceNetworks'] = {'objects': source_objects}
         
-        # Description
-        desc_parts = []
-        if wg_policy.description:
-            desc_parts.append(wg_policy.description)
-        if wg_policy.has_nat:
-            desc_parts.append(f"NAT Policy: {wg_policy.nat_policy}")
-            policy_data['warnings'].append(f"Policy has NAT - not migrated: {wg_policy.nat_policy}")
-        if wg_policy.action == 'Proxy':
-            desc_parts.append("Original action: Proxy")
-            policy_data['warnings'].append("Proxy action converted to Allow")
+        # Add destination networks
+        if dest_objects:
+            fmc_rule['destinationNetworks'] = {'objects': dest_objects}
         
-        policy_data['fmc_rule']['commentHistoryList'] = [' | '.join(desc_parts)[:1000]]
+        # Add services
+        if service_objects:
+            fmc_rule['destinationPorts'] = {'objects': service_objects}
         
-        # Service mapping - THIS IS THE CRITICAL PART
-        service_obj = self.service_mapper.get_mapping(wg_policy.service)
-        if service_obj:
-            policy_data['fmc_rule']['destinationPorts'] = {
-                'objects': [{
-                    'type': service_obj.type,
-                    'id': service_obj.id,
-                    'name': service_obj.name
-                }]
-            }
-        elif wg_policy.service != "Any":
-            policy_data['errors'].append(f"Service not mapped: {wg_policy.service}")
-        
-        # Application control
-        if wg_policy.has_app_control:
-            app_objects = self._resolve_app_action(wg_policy.app_action, plan, policy_data)
-            if app_objects:
-                policy_data['fmc_rule']['applications'] = {
-                    'applications': app_objects
-                }
-        
-        return policy_data
+        return {
+            'wg_policy': policy.name,
+            'fmc_rule': fmc_rule,
+            'issues': issues,
+            'warnings': warnings,
+            'errors': issues  # For compatibility
+        }, issues
     
-    def _resolve_app_action(
-        self,
-        app_action_name: str,
-        plan: MigrationPlan,
-        policy_data: Dict
-    ) -> List[Dict]:
-        """Resolve application action to FMC application objects."""
-        # Find the app action
-        app_action = None
-        for action in self.wg_config.app_actions:
-            if action.name == app_action_name:
-                app_action = action
-                break
-        
-        if not app_action:
-            policy_data['errors'].append(f"App action not found: {app_action_name}")
-            return []
-        
-        # Map allowed apps
-        app_objects = []
-        unmapped_count = 0
-        
-        for wg_app_name in app_action.allowed_apps:
-            fmc_app = self.app_mapper.get_mapping(wg_app_name)
-            if fmc_app:
-                app_objects.append({
-                    'type': 'Application',
-                    'id': fmc_app.id,
-                    'name': fmc_app.name
-                })
-            else:
-                unmapped_count += 1
-        
-        if unmapped_count > 0:
-            policy_data['warnings'].append(
-                f"{unmapped_count} applications not mapped in app action {app_action_name}"
-            )
-        
-        # Note: Blocked apps would need separate deny rules or inverse logic
-        if app_action.blocked_apps:
-            policy_data['warnings'].append(
-                f"App action has {len(app_action.blocked_apps)} blocked apps - not migrated"
-            )
-        
-        return app_objects
+    def _get_fmc_type(self, wg_type: str) -> str:
+        """Convert WatchGuard object type to FMC type."""
+        type_map = {
+            'host': 'Host',
+            'network': 'Network',
+            'range': 'Range',
+            'fqdn': 'FQDN'
+        }
+        return type_map.get(wg_type, 'Host')
     
-    def _calculate_statistics(self, plan: MigrationPlan):
-        """Calculate migration statistics."""
-        plan.total_wg_objects = (
-            len(self.wg_config.hosts) +
-            len(self.wg_config.networks) +
-            len(self.wg_config.ranges) +
-            len(self.wg_config.fqdns) +
-            len(self.wg_config.tcp_services) +
-            len(self.wg_config.udp_services) +
-            len(self.wg_config.icmp_services)
-        )
+    def save_plan(self, plan: MigrationPlan, filename: str = "migration_plan.json"):
+        """Save migration plan to JSON file."""
+        # Convert to serializable format
+        plan_dict = {
+            'address_mappings': {k: asdict(v) for k, v in plan.address_mappings.items()},
+            'service_mappings': {k: asdict(v) for k, v in plan.service_mappings.items()},
+            'application_mappings': {k: asdict(v) for k, v in plan.application_mappings.items()},
+            'objects_to_create': plan.objects_to_create,
+            'policies_to_create': plan.policies_to_create,
+            'statistics': plan.statistics
+        }
         
-        plan.mapped_to_existing = (
-            len(plan.address_mappings) +
-            len(plan.service_mappings) +
-            len(plan.app_mappings)
-        )
+        with open(filename, 'w') as f:
+            json.dump(plan_dict, f, indent=2, default=str)
         
-        plan.needs_creation = len(plan.objects_to_create)
-        
-        plan.unmapped = (
-            len(self.service_mapper.unmapped_services) +
-            len(self.app_mapper.unmapped_apps)
-        )
-    
-    def _print_summary(self, plan: MigrationPlan):
-        """Print migration plan summary."""
-        print("\n" + "="*60)
-        print("MIGRATION PLAN COMPLETE")
-        print("="*60)
-        
-        print(f"\nObject Mapping:")
-        print(f"  Total WG objects:     {plan.total_wg_objects}")
-        print(f"  Mapped to existing:   {plan.mapped_to_existing}")
-        print(f"  Needs creation:       {plan.needs_creation}")
-        print(f"  Unmapped:             {plan.unmapped}")
-        
-        print(f"\nService Mapping:")
-        svc_stats = self.service_mapper.get_statistics()
-        print(f"  WG services:          {svc_stats['total_wg_services']}")
-        print(f"  Canonical objects:    {svc_stats['unique_canonical_objects']}")
-        print(f"  Deduplicated:         {svc_stats['services_deduplicated']}")
-        
-        print(f"\nApplication Mapping:")
-        app_stats = self.app_mapper.get_statistics()
-        print(f"  WG applications:      {app_stats['total_wg_apps']}")
-        print(f"  Mapped:               {app_stats['mapped']}")
-        print(f"  Unmapped:             {app_stats['unmapped']}")
-        
-        print(f"\nPolicies:")
-        print(f"  To create:            {len(plan.policies_to_create)}")
-        
-        policies_with_warnings = sum(1 for p in plan.policies_to_create if p['warnings'])
-        policies_with_errors = sum(1 for p in plan.policies_to_create if p['errors'])
-        
-        print(f"  With warnings:        {policies_with_warnings}")
-        print(f"  With errors:          {policies_with_errors}")
+        print(f"\n✓ Migration plan saved to: {filename}")
