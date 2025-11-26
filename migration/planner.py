@@ -52,6 +52,17 @@ class MigrationPlanner:
             self.services[tcp.name] = tcp
         for udp in self.wg_config.udp_services:
             self.services[udp.name] = udp
+        
+        # Extract wildcard URLs from FQDNs for URL object creation
+        self.url_objects = []
+        for fqdn in self.wg_config.fqdns:
+            if '*' in fqdn.fqdn or fqdn.fqdn.startswith('.'):
+                # This is a wildcard that should be a URL object
+                self.url_objects.append({
+                    'name': fqdn.name,
+                    'url': fqdn.fqdn,
+                    'description': fqdn.description
+                })
     
     def resolve_alias_to_objects(self, alias_name: str, visited: Optional[Set[str]] = None) -> List[str]:
         """Recursively resolve alias to address object names."""
@@ -95,8 +106,25 @@ class MigrationPlanner:
         print("="*60)
         
         address_mappings = {}
-        service_mappings = self.service_mapper.service_mappings
-        application_mappings = self.app_mapper.application_mappings
+        
+        # Service mappings - handle different attribute names
+        if hasattr(self.service_mapper, 'service_mappings'):
+            service_mappings = self.service_mapper.service_mappings
+        elif hasattr(self.service_mapper, 'mappings'):
+            service_mappings = self.service_mapper.mappings
+        else:
+            service_mappings = {}
+            print("  ⚠ Warning: ServiceMapper has no mappings attribute")
+        
+        # Application mappings - handle different attribute names
+        if hasattr(self.app_mapper, 'mappings'):
+            application_mappings = self.app_mapper.mappings
+        elif hasattr(self.app_mapper, 'application_mappings'):
+            application_mappings = self.app_mapper.application_mappings
+        else:
+            application_mappings = {}
+            print("  ⚠ Warning: ApplicationMapper has no mappings attribute")
+        
         objects_to_create = []
         policies_to_create = []
         
@@ -110,6 +138,11 @@ class MigrationPlanner:
                 objects_to_create.append({'type': 'service', 'wg_object': obj})
         
         print("\nMapping applications...")
+        
+        print("\nProcessing URL objects...")
+        for url_obj in self.url_objects:
+            objects_to_create.append({'type': 'url', 'wg_object': url_obj})
+        print(f"  Found {len(self.url_objects)} wildcard URLs to create as URL objects")
         
         print("\nIdentifying objects to create...")
         print(f"  Objects to create: {len(objects_to_create)}")
