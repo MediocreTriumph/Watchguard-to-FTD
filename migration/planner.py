@@ -187,19 +187,14 @@ class MigrationPlanner:
         issues = []
         warnings = []
         
+        # WatchGuardPolicy only has source_members and destination_members
+        # These can be either direct objects OR aliases - we resolve both
+        
         # Resolve sources
         source_objects = []
-        for alias in policy.source_aliases:
-            for name in self.resolve_alias_to_objects(alias):
-                if name in self.address_objects:
-                    wg_obj = self.address_objects[name]
-                    source_objects.append({
-                        'type': self._get_fmc_type(wg_obj.object_type),
-                        'name': name
-                    })
-        
         for member in policy.source_members:
-            for name in self.resolve_alias_to_objects(member):
+            resolved_names = self.resolve_alias_to_objects(member)
+            for name in resolved_names:
                 if name in self.address_objects:
                     wg_obj = self.address_objects[name]
                     source_objects.append({
@@ -209,17 +204,9 @@ class MigrationPlanner:
         
         # Resolve destinations
         dest_objects = []
-        for alias in policy.destination_aliases:
-            for name in self.resolve_alias_to_objects(alias):
-                if name in self.address_objects:
-                    wg_obj = self.address_objects[name]
-                    dest_objects.append({
-                        'type': self._get_fmc_type(wg_obj.object_type),
-                        'name': name
-                    })
-        
         for member in policy.destination_members:
-            for name in self.resolve_alias_to_objects(member):
+            resolved_names = self.resolve_alias_to_objects(member)
+            for name in resolved_names:
                 if name in self.address_objects:
                     wg_obj = self.address_objects[name]
                     dest_objects.append({
@@ -229,29 +216,32 @@ class MigrationPlanner:
         
         # Services
         service_objects = []
-        if policy.service in service_mappings:
-            obj = service_mappings[policy.service]
-            service_objects.append({
-                'type': obj.type,
-                'id': obj.id,
-                'name': obj.name,
-                'protocol': obj.protocol,
-                'port': obj.port
-            })
-        elif policy.service in self.services:
-            wg_svc = self.services[policy.service]
-            service_objects.append({
-                'type': 'ProtocolPortObject',
-                'name': policy.service,
-                'protocol': wg_svc.protocol,
-                'port': wg_svc.port
-            })
+        if policy.service and policy.service != 'Any':
+            if policy.service in service_mappings:
+                obj = service_mappings[policy.service]
+                service_objects.append({
+                    'type': obj.type,
+                    'id': obj.id,
+                    'name': obj.name,
+                    'protocol': getattr(obj, 'protocol', None),
+                    'port': getattr(obj, 'port', None)
+                })
+            elif policy.service in self.services:
+                wg_svc = self.services[policy.service]
+                service_objects.append({
+                    'type': 'ProtocolPortObject',
+                    'name': policy.service,
+                    'protocol': wg_svc.protocol,
+                    'port': wg_svc.port
+                })
+            else:
+                warnings.append(f"Service '{policy.service}' not found")
         
         # Check issues
-        if not source_objects and (policy.source_aliases or policy.source_members):
-            issues.append("No source objects resolved")
-        if not dest_objects and (policy.destination_aliases or policy.destination_members):
-            issues.append("No destination objects resolved")
+        if not source_objects and policy.source_members and policy.source_members != ['Any']:
+            issues.append(f"No source objects resolved from: {policy.source_members}")
+        if not dest_objects and policy.destination_members and policy.destination_members != ['Any']:
+            issues.append(f"No destination objects resolved from: {policy.destination_members}")
         
         # Build FMC rule
         fmc_rule = {
