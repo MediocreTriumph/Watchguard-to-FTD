@@ -20,6 +20,35 @@ class MigrationPlan:
     objects_to_create: List[Dict]
     policies_to_create: List[Dict]
     statistics: Dict[str, int]
+    
+    # Add direct attributes for CLI compatibility
+    @property
+    def total_wg_objects(self):
+        return self.statistics.get('total_wg_objects', 0)
+    
+    @property
+    def mapped_to_existing(self):
+        return self.statistics.get('mapped_to_existing', 0)
+    
+    @property
+    def needs_creation(self):
+        return self.statistics.get('needs_creation', 0)
+    
+    @property
+    def unmapped(self):
+        return self.statistics.get('unmapped', 0)
+    
+    @property
+    def total_policies(self):
+        return self.statistics.get('total_policies', 0)
+    
+    @property
+    def policies_with_warnings(self):
+        return self.statistics.get('policies_with_warnings', 0)
+    
+    @property
+    def policies_with_errors(self):
+        return self.statistics.get('policies_with_errors', 0)
 
 
 class MigrationPlanner:
@@ -165,11 +194,13 @@ class MigrationPlanner:
         
         statistics = {
             'total_wg_objects': len(self.address_objects),
-            'mapped_to_existing': 0,
+            'mapped_to_existing': len(address_mappings),
             'needs_creation': len(objects_to_create),
             'unmapped': 0,
             'total_policies': len(self.wg_config.policies),
-            'policies_with_issues': policies_with_issues
+            'policies_with_issues': policies_with_issues,
+            'policies_with_warnings': 0,
+            'policies_with_errors': policies_with_issues
         }
         
         return MigrationPlan(
