@@ -54,6 +54,28 @@ class MigrationPlan:
     def app_mappings(self):
         """Alias for application_mappings for CLI compatibility."""
         return self.application_mappings
+    
+    @property
+    def warnings(self) -> List[str]:
+        """Aggregate all warnings from policies_to_create."""
+        all_warnings = []
+        for policy in self.policies_to_create:
+            policy_warnings = policy.get('warnings', [])
+            policy_name = policy.get('wg_policy', 'Unknown')
+            for warning in policy_warnings:
+                all_warnings.append(f"[{policy_name}] {warning}")
+        return all_warnings
+    
+    @property
+    def errors(self) -> List[str]:
+        """Aggregate all errors from policies_to_create."""
+        all_errors = []
+        for policy in self.policies_to_create:
+            policy_errors = policy.get('errors', [])
+            policy_name = policy.get('wg_policy', 'Unknown')
+            for error in policy_errors:
+                all_errors.append(f"[{policy_name}] {error}")
+        return all_errors
 
 
 class MigrationPlanner:
@@ -186,12 +208,15 @@ class MigrationPlanner:
         
         print("\nPlanning policy migration...")
         policies_with_issues = 0
+        policies_with_warnings = 0
         
         for policy in self.wg_config.policies:
             policy_plan, issues = self._plan_policy(policy, address_mappings, 
                                                     service_mappings, application_mappings)
             if issues:
                 policies_with_issues += 1
+            if policy_plan.get('warnings'):
+                policies_with_warnings += 1
             policies_to_create.append(policy_plan)
         
         print(f"  Total policies: {len(self.wg_config.policies)}")
@@ -204,7 +229,7 @@ class MigrationPlanner:
             'unmapped': 0,
             'total_policies': len(self.wg_config.policies),
             'policies_with_issues': policies_with_issues,
-            'policies_with_warnings': 0,
+            'policies_with_warnings': policies_with_warnings,
             'policies_with_errors': policies_with_issues
         }
         
