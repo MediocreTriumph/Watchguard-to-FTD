@@ -31,6 +31,10 @@ class PolicyAuditResult:
     missing_services: Dict[str, List[str]] = field(default_factory=dict)
     missing_applications: Dict[str, List[str]] = field(default_factory=dict)
     
+    # NEW: Rules that should have objects but don't
+    rules_with_empty_sources: List[str] = field(default_factory=list)
+    rules_with_empty_destinations: List[str] = field(default_factory=list)
+    
     # Mapping issues
     unmapped_policies: List[str] = field(default_factory=list)
     incomplete_policies: List[str] = field(default_factory=list)
@@ -46,6 +50,8 @@ class PolicyAuditResult:
             len(self.missing_dest_objects) +
             len(self.missing_services) +
             len(self.missing_applications) +
+            len(self.rules_with_empty_sources) +
+            len(self.rules_with_empty_destinations) +
             len(self.unmapped_policies) +
             len(self.incomplete_policies)
         )
@@ -165,16 +171,41 @@ class PolicyAuditor:
     
     def _compare_policies(self, result: PolicyAuditResult):
         """Compare WatchGuard policies with FMC rules."""
-        # Build a map of FMC rule names
-        fmc_rule_names = {rule['name'] for rule in self.fmc_rules}
+        # Build a map of FMC rules by name
+        fmc_rules_by_name = {rule['name']: rule for rule in self.fmc_rules}
         
         # Check each WatchGuard policy
         for wg_policy in self.wg_config.policies:
             # Truncate to FMC's 50 character limit for comparison
             wg_policy_name = wg_policy.name[:50]
             
-            if wg_policy_name in fmc_rule_names:
+            if wg_policy_name in fmc_rules_by_name:
                 result.migrated_policies += 1
+                
+                # Check if FMC rule is missing source/destination objects
+                fmc_rule = fmc_rules_by_name[wg_policy_name]
+                
+                # Check sources
+                wg_has_sources = (
+                    len(wg_policy.source_members) > 0 or 
+                    len(wg_policy.source_aliases) > 0
+                )
+                fmc_source_objects = fmc_rule.get('sourceNetworks', {}).get('objects', [])
+                fmc_has_sources = len(fmc_source_objects) > 0
+                
+                if wg_has_sources and not fmc_has_sources:
+                    result.rules_with_empty_sources.append(wg_policy_name)
+                
+                # Check destinations
+                wg_has_dests = (
+                    len(wg_policy.destination_members) > 0 or 
+                    len(wg_policy.destination_aliases) > 0
+                )
+                fmc_dest_objects = fmc_rule.get('destinationNetworks', {}).get('objects', [])
+                fmc_has_dests = len(fmc_dest_objects) > 0
+                
+                if wg_has_dests and not fmc_has_dests:
+                    result.rules_with_empty_destinations.append(wg_policy_name)
             else:
                 # Check if disabled
                 if not wg_policy.enabled:
@@ -262,6 +293,24 @@ class PolicyAuditor:
         print(f"  Rules with missing services:     {len(result.missing_services)}")
         print(f"  Rules with missing applications: {len(result.missing_applications)}")
         
+        print(f"\nRules with Empty Objects (CRITICAL):")
+        print(f"  Rules missing ALL sources:       {len(result.rules_with_empty_sources)}")
+        print(f"  Rules missing ALL destinations:  {len(result.rules_with_empty_destinations)}")
+        
+        if result.rules_with_empty_sources:
+            print(f"\n  Rules with Empty Sources (first 10):")
+            for rule in result.rules_with_empty_sources[:10]:
+                print(f"    - {rule}")
+            if len(result.rules_with_empty_sources) > 10:
+                print(f"    ... and {len(result.rules_with_empty_sources) - 10} more")
+        
+        if result.rules_with_empty_destinations:
+            print(f"\n  Rules with Empty Destinations (first 10):")
+            for rule in result.rules_with_empty_destinations[:10]:
+                print(f"    - {rule}")
+            if len(result.rules_with_empty_destinations) > 10:
+                print(f"    ... and {len(result.rules_with_empty_destinations) - 10} more")
+        
         if result.missing_source_objects:
             print(f"\n  Sample Missing Source Objects:")
             for rule, objs in list(result.missing_source_objects.items())[:3]:
@@ -287,9 +336,13 @@ class PolicyAuditor:
                 'total_wg_policies': result.total_wg_policies,
                 'migrated_policies': result.migrated_policies,
                 'missing_policies_count': len(result.missing_policies),
+                'rules_with_empty_sources_count': len(result.rules_with_empty_sources),
+                'rules_with_empty_destinations_count': len(result.rules_with_empty_destinations),
                 'total_issues': result.total_issues
             },
             'missing_policies': result.missing_policies,
+            'rules_with_empty_sources': result.rules_with_empty_sources,
+            'rules_with_empty_destinations': result.rules_with_empty_destinations,
             'missing_source_objects': result.missing_source_objects,
             'missing_dest_objects': result.missing_dest_objects,
             'missing_services': result.missing_services,
