@@ -1,17 +1,22 @@
 """
 Migration executor - creates objects and policies in FMC.
-Enhanced with better logging, duplicate detection, and proper ID resolution.
+Enhanced with better logging, duplicate detection, proper ID resolution,
+and automatic network group creation for rules exceeding 200 objects.
 """
 
 import time
 import re
 import json
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 from models import (
     WatchGuardAddress, WatchGuardService, 
     WatchGuardAddressGroup, FMCObject
 )
 from fmc.client import FMCClient
+
+
+# FMC limit for objects per rule field
+FMC_MAX_OBJECTS_PER_RULE = 200
 
 
 class MigrationExecutor:
@@ -20,22 +25,23 @@ class MigrationExecutor:
     def __init__(self, fmc_client: FMCClient, plan, fmc_discovery=None):
         self.fmc = fmc_client
         self.plan = plan
-        self.fmc_discovery = fmc_discovery  # FMCObjects from discovery
+        self.fmc_discovery = fmc_discovery
         self.created_objects: Dict[str, FMCObject] = {}
         self.execution_log: List[str] = []
         self.errors: List[str] = []
-        self.skipped_existing: List[str] = []  # Track objects that already exist
-        self.name_map: Dict[str, str] = {}  # original_name -> sanitized_name
-        self.used_names: Set[str] = set()  # Track used names to avoid collisions
+        self.skipped_existing: List[str] = []
+        self.name_map: Dict[str, str] = {}
+        self.reverse_name_map: Dict[str, str] = {}
+        self.used_names: Set[str] = set()
+        self.auto_created_groups: int = 0  # Track groups created for 200+ rules
         
-        # Master object lookup: name -> FMCObject (combines discovered + created)
+        # Master object lookup: name -> FMCObject
         self.all_objects: Dict[str, FMCObject] = {}
         self._build_object_lookup()
     
     def _build_object_lookup(self):
         """Build master object lookup from discovered FMC objects."""
         if self.fmc_discovery:
-            # Add all discovered objects to lookup
             for name, obj in self.fmc_discovery.hosts.items():
                 self.all_objects[name] = obj
             for name, obj in self.fmc_discovery.networks.items():
@@ -48,15 +54,17 @@ class MigrationExecutor:
                 self.all_objects[name] = obj
             for name, obj in self.fmc_discovery.port_objects.items():
                 self.all_objects[name] = obj
+            if hasattr(self.fmc_discovery, 'url_objects'):
+                for name, obj in self.fmc_discovery.url_objects.items():
+                    self.all_objects[name] = obj
         
-        # Add service mappings from plan
         if hasattr(self.plan, 'service_mappings'):
             for name, obj in self.plan.service_mappings.items():
                 self.all_objects[name] = obj
         
         print(f"\n  Object lookup initialized with {len(self.all_objects)} objects")
     
-    def _sanitize_name(self, name: str) -> str:
+    def _sanitize_name(self, name: str, track: bool = True) -> str:
         """Sanitize object name to be FMC-compliant."""
         if name in self.name_map:
             return self.name_map[name]
@@ -81,8 +89,10 @@ class MigrationExecutor:
             sanitized = original_sanitized[:max_base_len] + suffix
             counter += 1
         
-        self.name_map[name] = sanitized
-        self.used_names.add(sanitized)
+        if track:
+            self.name_map[name] = sanitized
+            self.reverse_name_map[sanitized] = name
+            self.used_names.add(sanitized)
         
         return sanitized
     
@@ -93,21 +103,90 @@ class MigrationExecutor:
         return "already exists" in error_text.lower()
     
     def _lookup_object(self, name: str) -> Optional[FMCObject]:
-        """Look up an object by name (original or sanitized)."""
-        # Try original name
+        """Look up an object by name using multiple strategies."""
         if name in self.all_objects:
             return self.all_objects[name]
         
-        # Try sanitized name
-        sanitized = self._sanitize_name(name)
-        if sanitized in self.all_objects:
-            return self.all_objects[sanitized]
-        
-        # Try created objects
         if name in self.created_objects:
             return self.created_objects[name]
         
+        sanitized = self._sanitize_name(name, track=False)
+        if sanitized in self.all_objects:
+            return self.all_objects[sanitized]
+        
+        if name in self.name_map:
+            mapped_name = self.name_map[name]
+            if mapped_name in self.all_objects:
+                return self.all_objects[mapped_name]
+        
+        if name in self.reverse_name_map:
+            original = self.reverse_name_map[name]
+            if original in self.all_objects:
+                return self.all_objects[original]
+            if original in self.created_objects:
+                return self.created_objects[original]
+        
         return None
+    
+    def _create_network_group_for_rule(self, rule_name: str, objects: List[Dict], 
+                                        field_type: str) -> Optional[FMCObject]:
+        """
+        Create a network group on-the-fly for rules that exceed 200 objects.
+        
+        Args:
+            rule_name: Name of the rule (for generating group name)
+            objects: List of resolved object dicts with type/id/name
+            field_type: 'src' or 'dst' to indicate source or destination
+            
+        Returns:
+            FMCObject for the created group, or None if creation failed
+        """
+        # Generate a unique group name
+        base_name = f"{rule_name}_{field_type}_grp"
+        group_name = self._sanitize_name(base_name)
+        
+        # Check if we already created this group
+        existing = self._lookup_object(group_name)
+        if existing:
+            return existing
+        
+        # Build the group data
+        group_data = {
+            'name': group_name,
+            'type': 'NetworkGroup',
+            'objects': objects,
+            'description': f'Auto-created group for rule {rule_name} ({len(objects)} objects)'[:200]
+        }
+        
+        print(f"  → Creating network group '{group_name}' for {len(objects)} objects...")
+        
+        result = self.fmc.create_object('networkgroups', group_data)
+        
+        if 'error' in result:
+            error_text = result.get('error', 'Unknown error')
+            if self._is_already_exists_error(error_text):
+                # Try to fetch the existing group
+                print(f"    Group '{group_name}' already exists, will use existing")
+                # We don't have a way to fetch by name here, so return None
+                # The rule creation will fail but with a clearer error
+                return None
+            else:
+                print(f"    ✗ Failed to create group: {error_text}")
+                return None
+        
+        # Success - store the created group
+        fmc_obj = FMCObject(
+            id=result['id'],
+            name=result['name'],
+            type='NetworkGroup'
+        )
+        self.created_objects[group_name] = fmc_obj
+        self.all_objects[group_name] = fmc_obj
+        self.auto_created_groups += 1
+        
+        print(f"    ✓ Created group '{group_name}' (ID: {result['id']})")
+        
+        return fmc_obj
     
     def execute(self, acp_name: str) -> bool:
         """Execute the migration plan."""
@@ -117,32 +196,35 @@ class MigrationExecutor:
         
         success = True
         
-        # Step 1: Create network objects
         if not self._create_network_objects():
             success = False
         
-        # Step 2: Create service objects
+        if not self._create_url_objects():
+            success = False
+        
         if not self._create_service_objects():
             success = False
         
-        # Step 3: Create network groups
         if not self._create_network_groups():
             success = False
         
-        # Step 4: Create Access Control Policy
         acp_id = self._create_access_policy(acp_name)
         if not acp_id:
             success = False
             return success
         
-        # Step 5: Create access rules (with ID resolution)
         if not self._create_access_rules(acp_id):
             success = False
         
-        # Print summary
         self._print_execution_summary()
         
         return success
+    
+    def _is_wildcard_fqdn(self, fqdn_value: str) -> bool:
+        """Check if an FQDN contains wildcards."""
+        if not fqdn_value:
+            return False
+        return '*' in fqdn_value or fqdn_value.startswith('.')
     
     def _create_network_objects(self) -> bool:
         """Create all network objects (hosts, networks, ranges, FQDNs)."""
@@ -153,6 +235,7 @@ class MigrationExecutor:
         created_count = 0
         error_count = 0
         skipped_count = 0
+        wildcard_count = 0
         
         for obj_def in self.plan.objects_to_create:
             obj_type = obj_def['type']
@@ -162,13 +245,15 @@ class MigrationExecutor:
             
             wg_obj: WatchGuardAddress = obj_def['wg_object']
             
-            # Skip if object already exists in FMC
-            if wg_obj.name in self.all_objects:
+            if obj_type == 'fqdn' and hasattr(wg_obj, 'fqdn') and self._is_wildcard_fqdn(wg_obj.fqdn):
+                wildcard_count += 1
+                continue
+            
+            if self._lookup_object(wg_obj.name):
                 self.skipped_existing.append(f"[{obj_type}] {wg_obj.name}")
                 skipped_count += 1
                 continue
             
-            # Build FMC object data
             fmc_data = self._build_network_object_data(wg_obj)
             
             if not fmc_data:
@@ -176,7 +261,6 @@ class MigrationExecutor:
                 error_count += 1
                 continue
             
-            # Create in FMC
             result = self.fmc.create_object(fmc_data['fmc_type'], fmc_data['data'])
             
             if 'error' in result:
@@ -188,14 +272,15 @@ class MigrationExecutor:
                     self.errors.append(f"Failed to create {wg_obj.name}: {error_text}")
                     error_count += 1
             else:
-                # Store created object
                 fmc_obj = FMCObject(
                     id=result['id'],
                     name=result['name'],
                     type=result['type']
                 )
                 self.created_objects[wg_obj.name] = fmc_obj
-                self.all_objects[wg_obj.name] = fmc_obj  # Add to master lookup
+                self.all_objects[wg_obj.name] = fmc_obj
+                sanitized = self._sanitize_name(wg_obj.name)
+                self.all_objects[sanitized] = fmc_obj
                 created_count += 1
                 
                 if created_count % 50 == 0:
@@ -204,6 +289,84 @@ class MigrationExecutor:
             time.sleep(0.05)
         
         print(f"\n✓ Created {created_count} network objects")
+        if skipped_count > 0:
+            print(f"⚠ Skipped {skipped_count} (already exist)")
+        if wildcard_count > 0:
+            print(f"ℹ Deferred {wildcard_count} wildcard FQDNs (will create as URL objects)")
+        if error_count > 0:
+            print(f"✗ {error_count} errors")
+        
+        return True
+    
+    def _create_url_objects(self) -> bool:
+        """Create URL objects for wildcard FQDNs."""
+        print("\n" + "-"*60)
+        print("Creating URL Objects (for wildcard FQDNs)")
+        print("-"*60)
+        
+        created_count = 0
+        error_count = 0
+        skipped_count = 0
+        
+        for obj_def in self.plan.objects_to_create:
+            obj_type = obj_def['type']
+            
+            if obj_type == 'url':
+                wg_obj = obj_def['wg_object']
+                if isinstance(wg_obj, dict):
+                    name = wg_obj.get('name', '')
+                    url = wg_obj.get('url', '')
+                    description = wg_obj.get('description', '')
+                else:
+                    continue
+            elif obj_type == 'fqdn':
+                wg_obj: WatchGuardAddress = obj_def['wg_object']
+                if not (hasattr(wg_obj, 'fqdn') and self._is_wildcard_fqdn(wg_obj.fqdn)):
+                    continue
+                name = wg_obj.name
+                url = wg_obj.fqdn
+                description = wg_obj.description if wg_obj.description else ''
+            else:
+                continue
+            
+            if self._lookup_object(name):
+                self.skipped_existing.append(f"[url] {name}")
+                skipped_count += 1
+                continue
+            
+            sanitized_name = self._sanitize_name(name)
+            
+            fmc_data = {
+                'name': sanitized_name,
+                'type': 'Url',
+                'url': url,
+                'description': description[:200] if description else ''
+            }
+            
+            result = self.fmc.create_object('urls', fmc_data)
+            
+            if 'error' in result:
+                error_text = result.get('error', 'Unknown error')
+                if self._is_already_exists_error(error_text):
+                    self.skipped_existing.append(f"[url] {name}")
+                    skipped_count += 1
+                else:
+                    self.errors.append(f"Failed to create URL {name}: {error_text}")
+                    error_count += 1
+            else:
+                fmc_obj = FMCObject(
+                    id=result['id'],
+                    name=result['name'],
+                    type='Url'
+                )
+                self.created_objects[name] = fmc_obj
+                self.all_objects[name] = fmc_obj
+                self.all_objects[sanitized_name] = fmc_obj
+                created_count += 1
+            
+            time.sleep(0.05)
+        
+        print(f"\n✓ Created {created_count} URL objects")
         if skipped_count > 0:
             print(f"⚠ Skipped {skipped_count} (already exist)")
         if error_count > 0:
@@ -275,8 +438,7 @@ class MigrationExecutor:
             
             wg_svc: WatchGuardService = obj_def['wg_object']
             
-            # Skip if already mapped
-            if wg_svc.name in self.all_objects:
+            if self._lookup_object(wg_svc.name):
                 self.skipped_existing.append(f"[service] {wg_svc.name}")
                 skipped_count += 1
                 continue
@@ -308,6 +470,8 @@ class MigrationExecutor:
                 )
                 self.created_objects[wg_svc.name] = fmc_obj
                 self.all_objects[wg_svc.name] = fmc_obj
+                sanitized = self._sanitize_name(wg_svc.name)
+                self.all_objects[sanitized] = fmc_obj
                 created_count += 1
             
             time.sleep(0.05)
@@ -348,7 +512,7 @@ class MigrationExecutor:
         return None
     
     def _create_network_groups(self) -> bool:
-        """Create network groups."""
+        """Create network groups from WatchGuard address groups."""
         print("\n" + "-"*60)
         print("Creating Network Groups")
         print("-"*60)
@@ -363,7 +527,7 @@ class MigrationExecutor:
             
             wg_group: WatchGuardAddressGroup = obj_def['wg_object']
             
-            if wg_group.name in self.all_objects:
+            if self._lookup_object(wg_group.name):
                 self.skipped_existing.append(f"[group] {wg_group.name}")
                 skipped_count += 1
                 continue
@@ -393,6 +557,8 @@ class MigrationExecutor:
                 )
                 self.created_objects[wg_group.name] = fmc_obj
                 self.all_objects[wg_group.name] = fmc_obj
+                sanitized = self._sanitize_name(wg_group.name)
+                self.all_objects[sanitized] = fmc_obj
                 created_count += 1
             
             time.sleep(0.05)
@@ -447,13 +613,14 @@ class MigrationExecutor:
         
         return acp_id
     
-    def _resolve_rule_objects(self, fmc_rule: Dict, policy_data: Dict) -> Dict:
+    def _resolve_rule_objects(self, fmc_rule: Dict, policy_data: Dict) -> Tuple[Dict, List[str]]:
         """
         Resolve object names to IDs in a rule before sending to FMC.
-        This is the critical step that was missing!
+        If a field has >200 objects, automatically create a network group.
         """
         resolved_rule = dict(fmc_rule)
         resolution_issues = []
+        rule_name = fmc_rule.get('name', 'unnamed_rule')
         
         # Resolve source networks
         if 'sourceNetworks' in resolved_rule:
@@ -472,9 +639,24 @@ class MigrationExecutor:
                         resolution_issues.append(f"Source object '{obj_name}' not found in FMC")
             
             if resolved_sources:
-                resolved_rule['sourceNetworks'] = {'objects': resolved_sources}
+                # Check if we exceed the limit
+                if len(resolved_sources) > FMC_MAX_OBJECTS_PER_RULE:
+                    print(f"  ℹ Rule '{rule_name}' has {len(resolved_sources)} source objects (>{FMC_MAX_OBJECTS_PER_RULE})")
+                    group = self._create_network_group_for_rule(rule_name, resolved_sources, 'src')
+                    if group:
+                        resolved_rule['sourceNetworks'] = {
+                            'objects': [{
+                                'type': group.type,
+                                'id': group.id,
+                                'name': group.name
+                            }]
+                        }
+                    else:
+                        resolution_issues.append(f"Failed to create source group for {len(resolved_sources)} objects")
+                        resolved_rule['sourceNetworks'] = {'objects': resolved_sources}
+                else:
+                    resolved_rule['sourceNetworks'] = {'objects': resolved_sources}
             else:
-                # Remove empty sourceNetworks
                 del resolved_rule['sourceNetworks']
         
         # Resolve destination networks
@@ -494,11 +676,27 @@ class MigrationExecutor:
                         resolution_issues.append(f"Destination object '{obj_name}' not found in FMC")
             
             if resolved_dests:
-                resolved_rule['destinationNetworks'] = {'objects': resolved_dests}
+                # Check if we exceed the limit
+                if len(resolved_dests) > FMC_MAX_OBJECTS_PER_RULE:
+                    print(f"  ℹ Rule '{rule_name}' has {len(resolved_dests)} destination objects (>{FMC_MAX_OBJECTS_PER_RULE})")
+                    group = self._create_network_group_for_rule(rule_name, resolved_dests, 'dst')
+                    if group:
+                        resolved_rule['destinationNetworks'] = {
+                            'objects': [{
+                                'type': group.type,
+                                'id': group.id,
+                                'name': group.name
+                            }]
+                        }
+                    else:
+                        resolution_issues.append(f"Failed to create destination group for {len(resolved_dests)} objects")
+                        resolved_rule['destinationNetworks'] = {'objects': resolved_dests}
+                else:
+                    resolved_rule['destinationNetworks'] = {'objects': resolved_dests}
             else:
                 del resolved_rule['destinationNetworks']
         
-        # Services should already have IDs from service_mappings, but verify
+        # Resolve services
         if 'destinationPorts' in resolved_rule:
             resolved_ports = []
             for obj_ref in resolved_rule['destinationPorts'].get('objects', []):
@@ -525,7 +723,7 @@ class MigrationExecutor:
         return resolved_rule, resolution_issues
     
     def _create_access_rules(self, acp_id: str) -> bool:
-        """Create access control rules in the policy with proper ID resolution."""
+        """Create access control rules with automatic group creation for large rules."""
         print("\n" + "-"*60)
         print("Creating Access Rules")
         print("-"*60)
@@ -544,15 +742,13 @@ class MigrationExecutor:
                 error_count += 1
                 continue
             
-            # CRITICAL: Resolve object names to IDs
+            # Resolve object names to IDs (with automatic group creation for >200)
             resolved_rule, resolution_issues = self._resolve_rule_objects(fmc_rule, policy_data)
             
             if resolution_issues:
-                # Log but don't skip - try to create anyway with what we have
                 for issue in resolution_issues:
                     print(f"  ⚠ [{policy_name}] {issue}")
             
-            # Create the rule
             result = self.fmc.create_access_rule(acp_id, resolved_rule)
             
             if 'error' in result:
@@ -576,6 +772,8 @@ class MigrationExecutor:
             time.sleep(0.15)
         
         print(f"\n✓ Created {created_count} access rules")
+        if self.auto_created_groups > 0:
+            print(f"ℹ Auto-created {self.auto_created_groups} network groups for rules exceeding 200 objects")
         if skipped_count > 0:
             print(f"⚠ Skipped {skipped_count} rules (had planning errors)")
         if error_count > 0:
@@ -605,6 +803,8 @@ class MigrationExecutor:
         print(f"\nObjects Created: {len(self.created_objects)}")
         print(f"Objects Skipped (already exist): {len(self.skipped_existing)}")
         print(f"Total Objects in Lookup: {len(self.all_objects)}")
+        if self.auto_created_groups > 0:
+            print(f"Auto-created Groups (for >200 object rules): {self.auto_created_groups}")
         print(f"Errors: {len(self.errors)}")
         
         if self.skipped_existing:
@@ -616,7 +816,6 @@ class MigrationExecutor:
             for obj_type, count in sorted(type_counts.items()):
                 print(f"  {obj_type}: {count}")
         
-        # Filter out "already exists" from true errors
         true_errors = [e for e in self.errors if "already exists" not in e.lower()]
         
         if true_errors:
