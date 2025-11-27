@@ -7,6 +7,7 @@ and automatic network group creation for rules exceeding 200 objects.
 import time
 import re
 import json
+import os
 from typing import Dict, List, Any, Optional, Set, Tuple
 from models import (
     WatchGuardAddress, WatchGuardService, 
@@ -33,7 +34,7 @@ class MigrationExecutor:
         self.name_map: Dict[str, str] = {}
         self.reverse_name_map: Dict[str, str] = {}
         self.used_names: Set[str] = set()
-        self.auto_created_groups: int = 0  # Track groups created for 200+ rules
+        self.auto_created_groups: int = 0
         
         # Master object lookup: name -> FMCObject
         self.all_objects: Dict[str, FMCObject] = {}
@@ -128,19 +129,34 @@ class MigrationExecutor:
         
         return None
     
+    def _is_host_mask(self, mask: str) -> bool:
+        """Check if a mask represents a single host (/32)."""
+        return mask in ['255.255.255.255', '32', '/32']
+    
+    def _is_wildcard_fqdn(self, fqdn_value: str) -> bool:
+        """Check if an FQDN contains wildcards."""
+        if not fqdn_value:
+            return False
+        return '*' in fqdn_value or fqdn_value.startswith('.')
+    
     def _create_network_group_for_rule(self, rule_name: str, objects: List[Dict], 
                                         field_type: str) -> Optional[FMCObject]:
         """
         Create a network group on-the-fly for rules that exceed 200 objects.
-        
-        Args:
-            rule_name: Name of the rule (for generating group name)
-            objects: List of resolved object dicts with type/id/name
-            field_type: 'src' or 'dst' to indicate source or destination
-            
-        Returns:
-            FMCObject for the created group, or None if creation failed
+        NOTE: Can only include network objects (Host, Network, Range, FQDN, NetworkGroup).
+        URL objects cannot be in network groups - they'll be handled separately.
         """
+        # Filter out URL objects - they can't be in network groups
+        network_objects = [obj for obj in objects if obj.get('type') != 'Url']
+        url_objects = [obj for obj in objects if obj.get('type') == 'Url']
+        
+        if url_objects:
+            print(f"    ⚠ Rule has {len(url_objects)} URL objects that cannot be grouped (FMC limitation)")
+        
+        # If after filtering we're under the limit, no need for a group
+        if len(network_objects) <= FMC_MAX_OBJECTS_PER_RULE:
+            return None
+        
         # Generate a unique group name
         base_name = f"{rule_name}_{field_type}_grp"
         group_name = self._sanitize_name(base_name)
@@ -154,21 +170,18 @@ class MigrationExecutor:
         group_data = {
             'name': group_name,
             'type': 'NetworkGroup',
-            'objects': objects,
-            'description': f'Auto-created group for rule {rule_name} ({len(objects)} objects)'[:200]
+            'objects': network_objects,
+            'description': f'Auto-created group for rule {rule_name} ({len(network_objects)} objects)'[:200]
         }
         
-        print(f"  → Creating network group '{group_name}' for {len(objects)} objects...")
+        print(f"  → Creating network group '{group_name}' for {len(network_objects)} network objects...")
         
         result = self.fmc.create_object('networkgroups', group_data)
         
         if 'error' in result:
             error_text = result.get('error', 'Unknown error')
             if self._is_already_exists_error(error_text):
-                # Try to fetch the existing group
                 print(f"    Group '{group_name}' already exists, will use existing")
-                # We don't have a way to fetch by name here, so return None
-                # The rule creation will fail but with a clearer error
                 return None
             else:
                 print(f"    ✗ Failed to create group: {error_text}")
@@ -220,12 +233,6 @@ class MigrationExecutor:
         
         return success
     
-    def _is_wildcard_fqdn(self, fqdn_value: str) -> bool:
-        """Check if an FQDN contains wildcards."""
-        if not fqdn_value:
-            return False
-        return '*' in fqdn_value or fqdn_value.startswith('.')
-    
     def _create_network_objects(self) -> bool:
         """Create all network objects (hosts, networks, ranges, FQDNs)."""
         print("\n" + "-"*60)
@@ -236,6 +243,7 @@ class MigrationExecutor:
         error_count = 0
         skipped_count = 0
         wildcard_count = 0
+        host_from_network_count = 0  # Track /32 networks converted to hosts
         
         for obj_def in self.plan.objects_to_create:
             obj_type = obj_def['type']
@@ -254,7 +262,14 @@ class MigrationExecutor:
                 skipped_count += 1
                 continue
             
-            fmc_data = self._build_network_object_data(wg_obj)
+            # Check if this "network" is actually a host (/32 mask)
+            actual_type = obj_type
+            if obj_type == 'network' and hasattr(wg_obj, 'mask') and wg_obj.mask:
+                if self._is_host_mask(wg_obj.mask):
+                    actual_type = 'host'
+                    host_from_network_count += 1
+            
+            fmc_data = self._build_network_object_data(wg_obj, actual_type)
             
             if not fmc_data:
                 self.errors.append(f"Failed to build data for {wg_obj.name}")
@@ -266,7 +281,7 @@ class MigrationExecutor:
             if 'error' in result:
                 error_text = result.get('error', 'Unknown error')
                 if self._is_already_exists_error(error_text):
-                    self.skipped_existing.append(f"[{obj_type}] {wg_obj.name}")
+                    self.skipped_existing.append(f"[{actual_type}] {wg_obj.name}")
                     skipped_count += 1
                 else:
                     self.errors.append(f"Failed to create {wg_obj.name}: {error_text}")
@@ -289,6 +304,8 @@ class MigrationExecutor:
             time.sleep(0.05)
         
         print(f"\n✓ Created {created_count} network objects")
+        if host_from_network_count > 0:
+            print(f"ℹ Converted {host_from_network_count} /32 networks to hosts")
         if skipped_count > 0:
             print(f"⚠ Skipped {skipped_count} (already exist)")
         if wildcard_count > 0:
@@ -374,18 +391,20 @@ class MigrationExecutor:
         
         return True
     
-    def _build_network_object_data(self, wg_obj: WatchGuardAddress) -> Optional[Dict]:
+    def _build_network_object_data(self, wg_obj: WatchGuardAddress, override_type: str = None) -> Optional[Dict]:
         """Build FMC API data for a network object."""
-        obj_type = wg_obj.object_type
+        obj_type = override_type or wg_obj.object_type
         sanitized_name = self._sanitize_name(wg_obj.name)
         
         if obj_type == 'host':
+            # Host can come from original host OR from /32 network
+            ip_value = wg_obj.ip if wg_obj.ip else wg_obj.network
             return {
                 'fmc_type': 'hosts',
                 'data': {
                     'name': sanitized_name,
                     'type': 'Host',
-                    'value': wg_obj.ip,
+                    'value': ip_value,
                     'description': wg_obj.description[:200] if wg_obj.description else ''
                 }
             }
@@ -579,6 +598,9 @@ class MigrationExecutor:
         for member_name in wg_group.members:
             obj = self._lookup_object(member_name)
             if obj:
+                # Skip URL objects - they can't be in network groups
+                if obj.type == 'Url':
+                    continue
                 objects.append({
                     'type': obj.type,
                     'id': obj.id,
@@ -616,32 +638,42 @@ class MigrationExecutor:
     def _resolve_rule_objects(self, fmc_rule: Dict, policy_data: Dict) -> Tuple[Dict, List[str]]:
         """
         Resolve object names to IDs in a rule before sending to FMC.
-        If a field has >200 objects, automatically create a network group.
+        Handles:
+        - Network objects (Host, Network, Range, FQDN, NetworkGroup) -> sourceNetworks/destinationNetworks
+        - URL objects -> urls field (separate from network objects)
+        - Auto-creates groups for >200 network objects
         """
         resolved_rule = dict(fmc_rule)
         resolution_issues = []
         rule_name = fmc_rule.get('name', 'unnamed_rule')
         
-        # Resolve source networks
+        # Resolve source networks and URLs
         if 'sourceNetworks' in resolved_rule:
             resolved_sources = []
+            resolved_source_urls = []
+            
             for obj_ref in resolved_rule['sourceNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
-                        resolved_sources.append({
+                        obj_entry = {
                             'type': fmc_obj.type,
                             'id': fmc_obj.id,
                             'name': fmc_obj.name
-                        })
+                        }
+                        # Separate URL objects from network objects
+                        if fmc_obj.type == 'Url':
+                            resolved_source_urls.append(obj_entry)
+                        else:
+                            resolved_sources.append(obj_entry)
                     else:
                         resolution_issues.append(f"Source object '{obj_name}' not found in FMC")
             
+            # Handle network objects (with potential grouping for >200)
             if resolved_sources:
-                # Check if we exceed the limit
                 if len(resolved_sources) > FMC_MAX_OBJECTS_PER_RULE:
-                    print(f"  ℹ Rule '{rule_name}' has {len(resolved_sources)} source objects (>{FMC_MAX_OBJECTS_PER_RULE})")
+                    print(f"  ℹ Rule '{rule_name}' has {len(resolved_sources)} source network objects (>{FMC_MAX_OBJECTS_PER_RULE})")
                     group = self._create_network_group_for_rule(rule_name, resolved_sources, 'src')
                     if group:
                         resolved_rule['sourceNetworks'] = {
@@ -652,33 +684,43 @@ class MigrationExecutor:
                             }]
                         }
                     else:
-                        resolution_issues.append(f"Failed to create source group for {len(resolved_sources)} objects")
                         resolved_rule['sourceNetworks'] = {'objects': resolved_sources}
                 else:
                     resolved_rule['sourceNetworks'] = {'objects': resolved_sources}
             else:
                 del resolved_rule['sourceNetworks']
+            
+            # Add URL objects to urls field (FMC doesn't support source URLs, so log warning)
+            if resolved_source_urls:
+                print(f"  ⚠ Rule '{rule_name}' has {len(resolved_source_urls)} source URL objects (FMC doesn't support source URLs)")
         
-        # Resolve destination networks
+        # Resolve destination networks and URLs
         if 'destinationNetworks' in resolved_rule:
             resolved_dests = []
+            resolved_dest_urls = []
+            
             for obj_ref in resolved_rule['destinationNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
-                        resolved_dests.append({
+                        obj_entry = {
                             'type': fmc_obj.type,
                             'id': fmc_obj.id,
                             'name': fmc_obj.name
-                        })
+                        }
+                        # Separate URL objects from network objects
+                        if fmc_obj.type == 'Url':
+                            resolved_dest_urls.append(obj_entry)
+                        else:
+                            resolved_dests.append(obj_entry)
                     else:
                         resolution_issues.append(f"Destination object '{obj_name}' not found in FMC")
             
+            # Handle network objects (with potential grouping for >200)
             if resolved_dests:
-                # Check if we exceed the limit
                 if len(resolved_dests) > FMC_MAX_OBJECTS_PER_RULE:
-                    print(f"  ℹ Rule '{rule_name}' has {len(resolved_dests)} destination objects (>{FMC_MAX_OBJECTS_PER_RULE})")
+                    print(f"  ℹ Rule '{rule_name}' has {len(resolved_dests)} destination network objects (>{FMC_MAX_OBJECTS_PER_RULE})")
                     group = self._create_network_group_for_rule(rule_name, resolved_dests, 'dst')
                     if group:
                         resolved_rule['destinationNetworks'] = {
@@ -689,12 +731,16 @@ class MigrationExecutor:
                             }]
                         }
                     else:
-                        resolution_issues.append(f"Failed to create destination group for {len(resolved_dests)} objects")
                         resolved_rule['destinationNetworks'] = {'objects': resolved_dests}
                 else:
                     resolved_rule['destinationNetworks'] = {'objects': resolved_dests}
             else:
-                del resolved_rule['destinationNetworks']
+                if 'destinationNetworks' in resolved_rule:
+                    del resolved_rule['destinationNetworks']
+            
+            # Add URL objects to urls field
+            if resolved_dest_urls:
+                resolved_rule['urls'] = {'objects': resolved_dest_urls}
         
         # Resolve services
         if 'destinationPorts' in resolved_rule:
@@ -786,13 +832,21 @@ class MigrationExecutor:
     
     def _save_rule_errors(self, rule_errors: List[Dict]):
         """Save detailed rule errors to file for analysis."""
-        filename = "rule_errors.json"
-        try:
-            with open(filename, 'w') as f:
-                json.dump(rule_errors, f, indent=2, default=str)
-            print(f"\n📄 Detailed rule errors saved to: {filename}")
-        except Exception as e:
-            print(f"\n⚠ Could not save rule errors: {e}")
+        # Save to current working directory AND outputs directory if it exists
+        filenames = ["rule_errors.json"]
+        
+        # Also try to save to outputs directory
+        outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'outputs')
+        if os.path.exists(outputs_dir):
+            filenames.append(os.path.join(outputs_dir, "rule_errors.json"))
+        
+        for filename in filenames:
+            try:
+                with open(filename, 'w') as f:
+                    json.dump(rule_errors, f, indent=2, default=str)
+                print(f"\n📄 Detailed rule errors saved to: {filename}")
+            except Exception as e:
+                print(f"\n⚠ Could not save rule errors to {filename}: {e}")
     
     def _print_execution_summary(self):
         """Print execution summary."""

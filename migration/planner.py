@@ -21,7 +21,6 @@ class MigrationPlan:
     policies_to_create: List[Dict]
     statistics: Dict[str, int]
     
-    # Add direct attributes for CLI compatibility
     @property
     def total_wg_objects(self):
         return self.statistics.get('total_wg_objects', 0)
@@ -89,17 +88,60 @@ class MigrationPlanner:
         self.app_mapper = app_mapper
         self._build_lookups()
     
+    def _is_host_mask(self, mask: str) -> bool:
+        """Check if a mask represents a single host (/32)."""
+        return mask in ['255.255.255.255', '32', '/32']
+    
+    def _is_wildcard_fqdn(self, wg_obj: WatchGuardAddress) -> bool:
+        """Check if an FQDN object contains wildcards (should be URL object)."""
+        if wg_obj.object_type != 'fqdn':
+            return False
+        if not hasattr(wg_obj, 'fqdn') or not wg_obj.fqdn:
+            return False
+        return '*' in wg_obj.fqdn or wg_obj.fqdn.startswith('.')
+    
+    def _get_actual_type(self, wg_obj: WatchGuardAddress) -> str:
+        """
+        Get the actual FMC type for an object, accounting for:
+        - Networks with /32 mask -> Host
+        - Wildcard FQDNs -> Url
+        """
+        obj_type = wg_obj.object_type
+        
+        # Check if this "network" is actually a host (/32 mask)
+        if obj_type == 'network' and hasattr(wg_obj, 'mask') and wg_obj.mask:
+            if self._is_host_mask(wg_obj.mask):
+                return 'host'
+        
+        # Check if this FQDN is a wildcard (-> URL)
+        if obj_type == 'fqdn' and self._is_wildcard_fqdn(wg_obj):
+            return 'url'
+        
+        return obj_type
+    
     def _build_lookups(self):
         """Build lookup structures."""
         self.address_objects = {}
+        self.wildcard_fqdns = set()  # Track which FQDNs are wildcards
+        self.host_networks = set()   # Track which networks are actually /32 hosts
+        
         for host in self.wg_config.hosts:
             self.address_objects[host.name] = host
+        
         for network in self.wg_config.networks:
             self.address_objects[network.name] = network
+            # Track /32 networks that should be hosts
+            if hasattr(network, 'mask') and network.mask and self._is_host_mask(network.mask):
+                self.host_networks.add(network.name)
+        
         for range_obj in self.wg_config.ranges:
             self.address_objects[range_obj.name] = range_obj
+        
         for fqdn in self.wg_config.fqdns:
             self.address_objects[fqdn.name] = fqdn
+            # Track wildcards
+            if self._is_wildcard_fqdn(fqdn):
+                self.wildcard_fqdns.add(fqdn.name)
         
         self.address_groups = {g.name: g for g in self.wg_config.address_groups}
         
@@ -109,16 +151,18 @@ class MigrationPlanner:
         for udp in self.wg_config.udp_services:
             self.services[udp.name] = udp
         
-        # Extract wildcard URLs from FQDNs for URL object creation
+        # URL objects list for creation
         self.url_objects = []
         for fqdn in self.wg_config.fqdns:
-            if '*' in fqdn.fqdn or fqdn.fqdn.startswith('.'):
-                # This is a wildcard that should be a URL object
+            if self._is_wildcard_fqdn(fqdn):
                 self.url_objects.append({
                     'name': fqdn.name,
                     'url': fqdn.fqdn,
                     'description': fqdn.description
                 })
+        
+        print(f"  Identified {len(self.wildcard_fqdns)} wildcard FQDNs (will be URL objects)")
+        print(f"  Identified {len(self.host_networks)} /32 networks (will be Host objects)")
     
     def resolve_alias_to_objects(self, alias_name: str, visited: Optional[Set[str]] = None) -> List[str]:
         """Recursively resolve alias to address object names."""
@@ -129,34 +173,29 @@ class MigrationPlanner:
             return []
         visited.add(alias_name)
         
-        # Skip interface aliases
         if alias_name in ["Any", "Any-External", "Any-Trusted", "Any-Optional"]:
             return []
         
-        # Direct address object
         if alias_name in self.address_objects:
             return [alias_name]
         
-        # Not a group
         if alias_name not in self.address_groups:
             return []
         
         group = self.address_groups[alias_name]
         resolved = []
         
-        # Direct members
         for member in group.members:
             if member in self.address_objects:
                 resolved.append(member)
         
-        # Recursive alias references
         for alias_ref in group.alias_references:
             resolved.extend(self.resolve_alias_to_objects(alias_ref, visited))
         
         return list(set(resolved))
     
     def _get_app_mappings(self) -> Dict[str, FMCObject]:
-        """Get application mappings from app_mapper, handling different attribute names."""
+        """Get application mappings from app_mapper."""
         if hasattr(self.app_mapper, 'app_mappings'):
             return self.app_mapper.app_mappings
         elif hasattr(self.app_mapper, 'mappings'):
@@ -176,7 +215,7 @@ class MigrationPlanner:
             return {}
     
     def _get_service_mappings(self) -> Dict[str, FMCObject]:
-        """Get service mappings from service_mapper, handling different attribute names."""
+        """Get service mappings from service_mapper."""
         if hasattr(self.service_mapper, 'service_mappings'):
             return self.service_mapper.service_mappings
         elif hasattr(self.service_mapper, 'mappings'):
@@ -204,7 +243,9 @@ class MigrationPlanner:
         
         print("\nMapping address objects...")
         for name, obj in self.address_objects.items():
-            objects_to_create.append({'type': obj.object_type, 'wg_object': obj})
+            # Use actual type (accounting for /32 hosts and wildcard URLs)
+            actual_type = self._get_actual_type(obj)
+            objects_to_create.append({'type': actual_type, 'wg_object': obj})
         
         print("\nMapping services...")
         for name, obj in self.services.items():
@@ -212,8 +253,8 @@ class MigrationPlanner:
                 objects_to_create.append({'type': 'service', 'wg_object': obj})
         
         print("\nProcessing URL objects...")
-        for url_obj in self.url_objects:
-            objects_to_create.append({'type': 'url', 'wg_object': url_obj})
+        # Note: wildcard FQDNs are already added with type='url' in the loop above
+        # The url_objects list is now redundant but kept for backwards compatibility
         print(f"  Found {len(self.url_objects)} wildcard URLs to create as URL objects")
         
         print("\nIdentifying objects to create...")
@@ -271,8 +312,10 @@ class MigrationPlanner:
             for name in resolved_names:
                 if name in self.address_objects:
                     wg_obj = self.address_objects[name]
+                    # Use correct type for the object
+                    fmc_type = self._get_fmc_type_for_object(wg_obj)
                     source_objects.append({
-                        'type': self._get_fmc_type(wg_obj.object_type),
+                        'type': fmc_type,
                         'name': name
                     })
         
@@ -283,8 +326,10 @@ class MigrationPlanner:
             for name in resolved_names:
                 if name in self.address_objects:
                     wg_obj = self.address_objects[name]
+                    # Use correct type for the object
+                    fmc_type = self._get_fmc_type_for_object(wg_obj)
                     dest_objects.append({
-                        'type': self._get_fmc_type(wg_obj.object_type),
+                        'type': fmc_type,
                         'name': name
                     })
         
@@ -317,17 +362,29 @@ class MigrationPlanner:
         if not dest_objects and policy.destination_members and policy.destination_members != ['Any']:
             issues.append(f"No destination objects resolved from: {policy.destination_members}")
         
-        # Warn if rule has too many objects (FMC limit is 200 per field)
-        if len(source_objects) > 200:
-            warnings.append(f"Rule has {len(source_objects)} source objects (FMC limit is 200)")
-        if len(dest_objects) > 200:
-            warnings.append(f"Rule has {len(dest_objects)} destination objects (FMC limit is 200)")
+        # Count network vs URL objects for accurate warnings
+        source_network_count = len([o for o in source_objects if o.get('type') != 'Url'])
+        dest_network_count = len([o for o in dest_objects if o.get('type') != 'Url'])
+        source_url_count = len([o for o in source_objects if o.get('type') == 'Url'])
+        dest_url_count = len([o for o in dest_objects if o.get('type') == 'Url'])
+        
+        # Warn if rule has too many network objects (FMC limit is 200 per field)
+        if source_network_count > 200:
+            warnings.append(f"Rule has {source_network_count} source network objects (FMC limit is 200, will auto-create group)")
+        if dest_network_count > 200:
+            warnings.append(f"Rule has {dest_network_count} destination network objects (FMC limit is 200, will auto-create group)")
+        
+        # Note URL objects
+        if source_url_count > 0:
+            warnings.append(f"Rule has {source_url_count} source URL objects (FMC doesn't support source URLs)")
+        if dest_url_count > 0:
+            # This is informational, not a warning - URLs are supported in destinations
+            pass
         
         # Build FMC rule
         action = self._map_action(policy.action)
         
         # FMC does not support logEnd for BLOCK actions
-        # For BLOCK rules, use logBegin instead if logging is enabled
         if action == 'BLOCK':
             log_begin = policy.log_enabled
             log_end = False
@@ -374,6 +431,19 @@ class MigrationPlanner:
             'block': 'BLOCK'
         }
         return action_map.get(wg_action.lower(), 'ALLOW')
+    
+    def _get_fmc_type_for_object(self, wg_obj: WatchGuardAddress) -> str:
+        """Get the correct FMC type for a WatchGuard object, accounting for special cases."""
+        # If it's a wildcard FQDN, it will be created as a URL object
+        if wg_obj.name in self.wildcard_fqdns:
+            return 'Url'
+        
+        # If it's a /32 network, it will be created as a Host object
+        if wg_obj.name in self.host_networks:
+            return 'Host'
+        
+        # Otherwise use standard mapping
+        return self._get_fmc_type(wg_obj.object_type)
     
     def _get_fmc_type(self, wg_type: str) -> str:
         """Convert WatchGuard type to FMC type."""
