@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import json
 from models import (
     WatchGuardConfig, WatchGuardPolicy, WatchGuardAddress, 
-    WatchGuardAddressGroup, WatchGuardService, FMCObject
+    WatchGuardAddressGroup, WatchGuardService, WatchGuardAppAction, FMCObject
 )
 
 
@@ -161,8 +161,16 @@ class MigrationPlanner:
                     'description': fqdn.description
                 })
         
+        # Build app_actions lookup by name
+        self.app_actions = {aa.name: aa for aa in self.wg_config.app_actions}
+        
         print(f"  Identified {len(self.wildcard_fqdns)} wildcard FQDNs (will be URL objects)")
         print(f"  Identified {len(self.host_networks)} /32 networks (will be Host objects)")
+        print(f"  Loaded {len(self.app_actions)} application action definitions")
+    
+    def _get_app_action_by_name(self, name: str) -> Optional[WatchGuardAppAction]:
+        """Look up an app_action by name."""
+        return self.app_actions.get(name)
     
     def resolve_alias_to_objects(self, alias_name: str, visited: Optional[Set[str]] = None) -> List[str]:
         """Recursively resolve alias to address object names."""
@@ -266,6 +274,7 @@ class MigrationPlanner:
         print("\nPlanning policy migration...")
         policies_with_issues = 0
         policies_with_warnings = 0
+        policies_with_apps = 0
         
         for policy in self.wg_config.policies:
             policy_plan, issues = self._plan_policy(policy, address_mappings, 
@@ -274,10 +283,13 @@ class MigrationPlanner:
                 policies_with_issues += 1
             if policy_plan.get('warnings'):
                 policies_with_warnings += 1
+            if policy_plan.get('fmc_rule', {}).get('applications'):
+                policies_with_apps += 1
             policies_to_create.append(policy_plan)
         
         print(f"  Total policies: {len(self.wg_config.policies)}")
         print(f"  With issues: {policies_with_issues}")
+        print(f"  With applications: {policies_with_apps}")
         
         statistics = {
             'total_wg_objects': len(self.address_objects),
@@ -287,7 +299,8 @@ class MigrationPlanner:
             'total_policies': len(self.wg_config.policies),
             'policies_with_issues': policies_with_issues,
             'policies_with_warnings': policies_with_warnings,
-            'policies_with_errors': policies_with_issues
+            'policies_with_errors': policies_with_issues,
+            'policies_with_applications': policies_with_apps
         }
         
         return MigrationPlan(
@@ -356,6 +369,31 @@ class MigrationPlanner:
             else:
                 warnings.append(f"Service '{policy.service}' not found")
         
+        # Applications - resolve from app_action reference
+        application_objects = []
+        unmapped_apps = []
+        if policy.app_action:
+            # Look up the app_action by name
+            app_action = self._get_app_action_by_name(policy.app_action)
+            if app_action:
+                # Get allowed apps from the app_action and map them to FMC
+                for wg_app_name in app_action.allowed_apps:
+                    if wg_app_name in application_mappings:
+                        fmc_app = application_mappings[wg_app_name]
+                        application_objects.append({
+                            'type': 'Application',
+                            'id': fmc_app.id,
+                            'name': fmc_app.name
+                        })
+                    else:
+                        unmapped_apps.append(wg_app_name)
+                
+                # Log warnings for unmapped applications
+                for unmapped in unmapped_apps:
+                    warnings.append(f"Application '{unmapped}' has no FMC mapping (app_action: {policy.app_action})")
+            else:
+                warnings.append(f"App action '{policy.app_action}' not found in WatchGuard config")
+        
         # Check issues
         if not source_objects and policy.source_members and policy.source_members != ['Any']:
             issues.append(f"No source objects resolved from: {policy.source_members}")
@@ -410,6 +448,10 @@ class MigrationPlanner:
             if valid_services:
                 fmc_rule['destinationPorts'] = {'objects': valid_services}
         
+        # Add applications if any were resolved
+        if application_objects:
+            fmc_rule['applications'] = {'applications': application_objects}
+        
         return {
             'wg_policy': policy.name,
             'fmc_rule': fmc_rule,
@@ -418,7 +460,10 @@ class MigrationPlanner:
             'errors': issues,
             'source_members_original': policy.source_members,
             'dest_members_original': policy.destination_members,
-            'service_original': policy.service
+            'service_original': policy.service,
+            'app_action_original': policy.app_action,
+            'applications_mapped': len(application_objects),
+            'applications_unmapped': unmapped_apps
         }, issues
     
     def _map_action(self, wg_action: str) -> str:

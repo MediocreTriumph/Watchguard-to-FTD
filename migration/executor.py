@@ -663,6 +663,7 @@ class MigrationExecutor:
         Handles:
         - Network objects (Host, Network, Range, FQDN, NetworkGroup) -> sourceNetworks/destinationNetworks
         - URL objects -> urls field (separate from network objects)
+        - Applications -> applications field (already resolved with IDs by planner)
         - Auto-creates groups for >200 network objects
         """
         resolved_rule = dict(fmc_rule)
@@ -788,6 +789,10 @@ class MigrationExecutor:
             else:
                 del resolved_rule['destinationPorts']
         
+        # Applications are already resolved with IDs by the planner - pass through unchanged
+        # The 'applications' field is already in the correct FMC format:
+        # {'applications': [{'type': 'Application', 'id': '...', 'name': '...'}]}
+        
         return resolved_rule, resolution_issues
     
     def _create_access_rules(self, acp_id: str) -> bool:
@@ -799,6 +804,8 @@ class MigrationExecutor:
         created_count = 0
         error_count = 0
         skipped_count = 0
+        rules_with_apps = 0
+        total_apps_applied = 0
         rule_errors: List[Dict] = []
         
         for idx, policy_data in enumerate(self.plan.policies_to_create):
@@ -809,6 +816,13 @@ class MigrationExecutor:
                 self.errors.append(f"Rule '{policy_name}': No FMC rule data generated")
                 error_count += 1
                 continue
+            
+            # Track application statistics
+            if 'applications' in fmc_rule:
+                app_count = len(fmc_rule['applications'].get('applications', []))
+                if app_count > 0:
+                    rules_with_apps += 1
+                    total_apps_applied += app_count
             
             # Resolve object names to IDs (with automatic group creation for >200)
             resolved_rule, resolution_issues = self._resolve_rule_objects(fmc_rule, policy_data)
@@ -840,6 +854,8 @@ class MigrationExecutor:
             time.sleep(0.15)
         
         print(f"\n✓ Created {created_count} access rules")
+        if rules_with_apps > 0:
+            print(f"ℹ {rules_with_apps} rules have applications ({total_apps_applied} total app references)")
         if self.auto_created_groups > 0:
             print(f"ℹ Auto-created {self.auto_created_groups} network groups for rules exceeding 200 objects")
         if skipped_count > 0:
