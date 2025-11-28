@@ -234,7 +234,7 @@ class MigrationExecutor:
         return success
     
     def _create_network_objects(self) -> bool:
-        """Create all network objects (hosts, networks, ranges, FQDNs)."""
+        """Create all network objects (hosts, networks, ranges, FQDNs - excludes URLs)."""
         print("\n" + "-"*60)
         print("Creating Network Objects")
         print("-"*60)
@@ -243,16 +243,22 @@ class MigrationExecutor:
         error_count = 0
         skipped_count = 0
         wildcard_count = 0
-        host_from_network_count = 0  # Track /32 networks converted to hosts
+        host_from_network_count = 0
         
         for obj_def in self.plan.objects_to_create:
             obj_type = obj_def['type']
             
+            # Skip URL types - handled separately
+            if obj_type == 'url':
+                continue
+            
+            # Only process standard network object types
             if obj_type not in ['host', 'network', 'range', 'fqdn']:
                 continue
             
             wg_obj: WatchGuardAddress = obj_def['wg_object']
             
+            # Skip wildcard FQDNs - they'll be created as URL objects
             if obj_type == 'fqdn' and hasattr(wg_obj, 'fqdn') and self._is_wildcard_fqdn(wg_obj.fqdn):
                 wildcard_count += 1
                 continue
@@ -327,23 +333,39 @@ class MigrationExecutor:
         
         for obj_def in self.plan.objects_to_create:
             obj_type = obj_def['type']
+            wg_obj = obj_def['wg_object']
             
+            # Handle URL type (includes wildcard FQDNs marked as 'url' by planner)
             if obj_type == 'url':
-                wg_obj = obj_def['wg_object']
                 if isinstance(wg_obj, dict):
+                    # Explicit URL dict from planner
                     name = wg_obj.get('name', '')
                     url = wg_obj.get('url', '')
-                    description = wg_obj.get('description', '')
+                    description = wg_obj.get('description', '') or ''
+                elif hasattr(wg_obj, 'fqdn') and wg_obj.fqdn:
+                    # WatchGuardAddress object marked as URL (wildcard FQDN)
+                    name = wg_obj.name
+                    url = wg_obj.fqdn
+                    description = wg_obj.description if wg_obj.description else ''
+                elif hasattr(wg_obj, 'name'):
+                    # Some other object with a name - skip
+                    continue
                 else:
                     continue
             elif obj_type == 'fqdn':
-                wg_obj: WatchGuardAddress = obj_def['wg_object']
-                if not (hasattr(wg_obj, 'fqdn') and self._is_wildcard_fqdn(wg_obj.fqdn)):
+                # Legacy path: FQDN objects that are wildcards but weren't retyped
+                if not hasattr(wg_obj, 'fqdn') or not wg_obj.fqdn:
+                    continue
+                if not self._is_wildcard_fqdn(wg_obj.fqdn):
                     continue
                 name = wg_obj.name
                 url = wg_obj.fqdn
                 description = wg_obj.description if wg_obj.description else ''
             else:
+                continue
+            
+            # Validate we have required data
+            if not name or not url:
                 continue
             
             if self._lookup_object(name):
@@ -832,21 +854,14 @@ class MigrationExecutor:
     
     def _save_rule_errors(self, rule_errors: List[Dict]):
         """Save detailed rule errors to file for analysis."""
-        # Save to current working directory AND outputs directory if it exists
-        filenames = ["rule_errors.json"]
-        
-        # Also try to save to outputs directory
-        outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'outputs')
-        if os.path.exists(outputs_dir):
-            filenames.append(os.path.join(outputs_dir, "rule_errors.json"))
-        
-        for filename in filenames:
-            try:
-                with open(filename, 'w') as f:
-                    json.dump(rule_errors, f, indent=2, default=str)
-                print(f"\n📄 Detailed rule errors saved to: {filename}")
-            except Exception as e:
-                print(f"\n⚠ Could not save rule errors to {filename}: {e}")
+        # Save to current working directory
+        filename = "rule_errors.json"
+        try:
+            with open(filename, 'w') as f:
+                json.dump(rule_errors, f, indent=2, default=str)
+            print(f"\n📄 Detailed rule errors saved to: {filename}")
+        except Exception as e:
+            print(f"\n⚠ Could not save rule errors to {filename}: {e}")
     
     def _print_execution_summary(self):
         """Print execution summary."""
