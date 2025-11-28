@@ -112,6 +112,7 @@ def run_migration(config: MigrationConfig) -> bool:
     print(f"  TCP Services:   {len(wg_config.tcp_services)}")
     print(f"  UDP Services:   {len(wg_config.udp_services)}")
     print(f"  Policies:       {len(wg_config.policies)}")
+    print(f"  App Actions:    {len(wg_config.app_actions)}")
     
     # Step 2: Connect to FMC
     print("\n" + "="*60)
@@ -176,6 +177,8 @@ def run_migration(config: MigrationConfig) -> bool:
         unique_apps.update(app_action.allowed_apps)
         unique_apps.update(app_action.blocked_apps)
     
+    print(f"  Found {len(unique_apps)} unique applications in {len(wg_config.app_actions)} app actions")
+    
     app_mapper = ApplicationMapper(fmc_objects, config.app_match_confidence_threshold)
     app_mapper.map_applications(sorted(unique_apps))
     
@@ -195,6 +198,11 @@ def run_migration(config: MigrationConfig) -> bool:
     plan_file = "migration_plan.json"
     save_migration_plan(plan, plan_file)
     print(f"\n✓ Migration plan saved to: {plan_file}")
+    
+    # Show application mapping summary
+    policies_with_apps = plan.statistics.get('policies_with_applications', 0)
+    if policies_with_apps > 0:
+        print(f"  Policies with applications: {policies_with_apps}")
     
     if config.dry_run:
         print("\n" + "="*60)
@@ -225,7 +233,8 @@ def save_migration_plan(plan, filename: str):
             'total_wg_objects': plan.total_wg_objects,
             'mapped_to_existing': plan.mapped_to_existing,
             'needs_creation': plan.needs_creation,
-            'unmapped': plan.unmapped
+            'unmapped': plan.unmapped,
+            'policies_with_applications': plan.statistics.get('policies_with_applications', 0)
         },
         'address_mappings': {
             name: {'id': obj.id, 'name': obj.name, 'type': obj.type}
