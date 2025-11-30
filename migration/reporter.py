@@ -5,6 +5,7 @@ Collects all errors, warnings, and statistics during migration and
 generates a comprehensive migration_report.json file.
 
 Updated for v5 parser with service group support.
+Updated for v6 with interface discovery and zone mapping.
 """
 
 import json
@@ -75,6 +76,20 @@ class ServiceGroupCreated:
     protocol_members: int
 
 
+@dataclass 
+class InterfaceAliasSkipped:
+    """Record of a skipped interface alias (v6)."""
+    name: str
+    interfaces: List[str]
+
+
+@dataclass
+class GroupWithSkippedInterfaces:
+    """Record of a group created with some interface members skipped (v6)."""
+    name: str
+    skipped_interfaces: List[str]
+
+
 class MigrationReporter:
     """
     Collects and reports all migration issues.
@@ -117,6 +132,11 @@ class MigrationReporter:
         self._service_groups_with_protocol = 0
         self._service_group_details: List[ServiceGroupCreated] = []
         
+        # Interface/zone tracking (v6)
+        self._interface_aliases_skipped: List[InterfaceAliasSkipped] = []
+        self._groups_with_skipped_interfaces: List[GroupWithSkippedInterfaces] = []
+        self.zone_mapping_report: Optional[Dict] = None
+        
         # Detailed records
         self._object_failures: List[ObjectFailure] = []
         self._rule_failures: List[RuleFailure] = []
@@ -151,9 +171,20 @@ class MigrationReporter:
     
     # ========== Group tracking ==========
     
-    def group_created(self, name: str):
-        """Record successful group creation."""
+    def group_created(self, name: str, skipped_interface_members: List[str] = None):
+        """Record successful group creation.
+        
+        Args:
+            name: Group name
+            skipped_interface_members: List of interface members that were skipped (v6)
+        """
         self._groups_created += 1
+        
+        if skipped_interface_members:
+            self._groups_with_skipped_interfaces.append(GroupWithSkippedInterfaces(
+                name=name,
+                skipped_interfaces=skipped_interface_members
+            ))
     
     def group_failed(self, name: str, reason: str, original_members: List[str] = None):
         """Record failed group creation."""
@@ -184,6 +215,13 @@ class MigrationReporter:
             port_members=port_members,
             icmp_members=icmp_members,
             protocol_members=protocol_members
+        ))
+    
+    def interface_alias_skipped(self, name: str, interfaces: List[str]):
+        """Record a skipped interface alias (v6)."""
+        self._interface_aliases_skipped.append(InterfaceAliasSkipped(
+            name=name,
+            interfaces=interfaces
         ))
     
     # ========== Rule tracking ==========
@@ -251,7 +289,7 @@ class MigrationReporter:
         total_objects_skipped = sum(self._objects_skipped.values())
         total_objects_failed = sum(self._objects_failed.values())
         
-        return {
+        summary = {
             "migration_started": self.start_time.isoformat(),
             "migration_completed": datetime.now().isoformat(),
             "duration_seconds": round((datetime.now() - self.start_time).total_seconds(), 2),
@@ -272,6 +310,14 @@ class MigrationReporter:
             "objects_skipped_by_type": dict(self._objects_skipped),
             "objects_failed_by_type": dict(self._objects_failed)
         }
+        
+        # Add interface/zone stats (v6)
+        if self._interface_aliases_skipped:
+            summary["interface_aliases_skipped"] = len(self._interface_aliases_skipped)
+        if self._groups_with_skipped_interfaces:
+            summary["groups_with_skipped_interface_members"] = len(self._groups_with_skipped_interfaces)
+        
+        return summary
     
     def get_errors(self) -> Dict[str, List[Dict]]:
         """Get all errors."""
@@ -292,7 +338,7 @@ class MigrationReporter:
     
     def get_warnings(self) -> Dict[str, List[Dict]]:
         """Get all warnings."""
-        return {
+        warnings = {
             "unmapped_applications": [
                 {"rule": w.rule, "application": w.application, 
                  "app_action": w.app_action, "reason": w.reason}
@@ -308,6 +354,23 @@ class MigrationReporter:
                 for w in self._incomplete_rules
             ]
         }
+        
+        # Add interface alias warnings (v6)
+        if self._interface_aliases_skipped:
+            warnings["interface_aliases_skipped"] = [
+                {"name": ia.name, "interfaces": ia.interfaces, 
+                 "reason": "Interface alias - not a network object group"}
+                for ia in self._interface_aliases_skipped
+            ]
+        
+        if self._groups_with_skipped_interfaces:
+            warnings["groups_with_skipped_interfaces"] = [
+                {"name": g.name, "skipped_interfaces": g.skipped_interfaces,
+                 "reason": "Interface members skipped - not network objects"}
+                for g in self._groups_with_skipped_interfaces
+            ]
+        
+        return warnings
     
     def get_detailed_failures(self) -> Dict[str, List[Dict]]:
         """Get detailed failure records including payloads for debugging."""
@@ -357,6 +420,10 @@ class MigrationReporter:
         # Include service group details if any were created (v5)
         if self._service_group_details:
             report["service_groups"] = self.get_service_group_details()
+        
+        # Include zone mapping report if available (v6)
+        if self.zone_mapping_report:
+            report["interface_mapping"] = self.zone_mapping_report
         
         return report
     
@@ -411,6 +478,22 @@ class MigrationReporter:
             if notes:
                 print(f" ({', '.join(notes)})", end="")
             print()
+        
+        # Interface/zone info (v6)
+        if summary.get('interface_aliases_skipped', 0) > 0:
+            print(f"   Interface Aliases: {summary['interface_aliases_skipped']} skipped (not network groups)")
+        if summary.get('groups_with_skipped_interface_members', 0) > 0:
+            print(f"   Groups with Interface Members: {summary['groups_with_skipped_interface_members']} (members skipped)")
+        
+        # Zone mapping summary (v6)
+        if self.zone_mapping_report:
+            zm = self.zone_mapping_report
+            zones = zm.get('fmc_zones_found', [])
+            mapped = len(zm.get('mapped', []))
+            unmapped = len(zm.get('unmapped', []))
+            print(f"   Zone Mapping: {mapped} mapped, {unmapped} unmapped")
+            if zones:
+                print(f"   FMC Zones: {', '.join(zones)}")
         
         errors = report["errors"]
         warnings = report["warnings"]

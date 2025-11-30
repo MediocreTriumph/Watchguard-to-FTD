@@ -3,6 +3,7 @@ Migration executor - creates objects and policies in FMC.
 Enhanced with unified reporting via MigrationReporter.
 
 Updated for v5 parser with service group support.
+Updated for v6 with interface discovery and zone mapping.
 """
 
 import time
@@ -25,10 +26,12 @@ FMC_MAX_OBJECTS_PER_RULE = 200
 class MigrationExecutor:
     """Executes migration plan by creating objects in FMC."""
     
-    def __init__(self, fmc_client: FMCClient, plan, fmc_discovery=None):
+    def __init__(self, fmc_client: FMCClient, plan, fmc_discovery=None, 
+                 zone_mapper=None):
         self.fmc = fmc_client
         self.plan = plan
         self.fmc_discovery = fmc_discovery
+        self.zone_mapper = zone_mapper
         self.created_objects: Dict[str, FMCObject] = {}
         self.execution_log: List[str] = []
         self.errors: List[str] = []
@@ -40,6 +43,10 @@ class MigrationExecutor:
         
         # Service group tracking (v5)
         self.created_service_groups: Dict[str, FMCObject] = {}
+        
+        # Zone mapping statistics (v6)
+        self.rules_with_zones: int = 0
+        self.rules_with_zone_warnings: int = 0
         
         # Unified reporter
         self.reporter = MigrationReporter()
@@ -116,6 +123,26 @@ class MigrationExecutor:
         if not error_text:
             return False
         return "already exists" in error_text.lower()
+    
+    def _is_interface_reference(self, name: str) -> bool:
+        """Check if a name refers to an interface rather than a network object."""
+        if self.zone_mapper:
+            return self.zone_mapper.is_interface_reference(name)
+        
+        # Fallback patterns when zone_mapper not available
+        interface_patterns = [
+            "Any-BOVPN", "Any-MUVPN", "Any-External", "Any-Trusted", 
+            "Any-Optional", "Any-Multicast", "Any"
+        ]
+        if name in interface_patterns:
+            return True
+        
+        # Check for common interface-like patterns
+        name_lower = name.lower()
+        if any(p in name_lower for p in ["bovpn", "muvpn", "vpn", "tunnel"]):
+            return True
+        
+        return False
     
     def _lookup_object(self, name: str) -> Optional[FMCObject]:
         """Look up an object by name using multiple strategies."""
@@ -246,15 +273,25 @@ class MigrationExecutor:
         acp_id = self._create_access_policy(acp_name)
         if not acp_id:
             success = False
-            self.reporter.save_report()
+            self._save_reports()
             return success
         
         if not self._create_access_rules(acp_id):
             success = False
         
-        self.reporter.save_report()
+        self._save_reports()
         
         return success
+    
+    def _save_reports(self):
+        """Save migration report, including zone mapping info if available."""
+        # Add zone mapping report if available
+        if self.zone_mapper:
+            zone_report = self.zone_mapper.get_report()
+            # Reporter will include this in the final report
+            self.reporter.zone_mapping_report = zone_report
+        
+        self.reporter.save_report()
     
     def _create_network_objects(self) -> bool:
         """Create all network objects (hosts, networks, ranges, FQDNs - excludes URLs)."""
@@ -776,7 +813,10 @@ class MigrationExecutor:
         return None
     
     def _create_network_groups(self) -> bool:
-        """Create network groups from WatchGuard address groups."""
+        """Create network groups from WatchGuard address groups.
+        
+        Updated in v6 to skip interface members and handle interface aliases.
+        """
         print("\n" + "-"*60)
         print("Creating Network Groups")
         print("-"*60)
@@ -784,6 +824,7 @@ class MigrationExecutor:
         created_count = 0
         error_count = 0
         skipped_count = 0
+        interface_alias_count = 0
         
         for obj_def in self.plan.objects_to_create:
             if obj_def['type'] != 'address_group':
@@ -791,19 +832,33 @@ class MigrationExecutor:
             
             wg_group: WatchGuardAddressGroup = obj_def['wg_object']
             
+            # Check if this is an interface alias (v6)
+            if hasattr(wg_group, 'member_interfaces') and wg_group.member_interfaces:
+                # This is an interface alias, skip it as a network group
+                interface_alias_count += 1
+                self.reporter.interface_alias_skipped(wg_group.name, wg_group.member_interfaces)
+                continue
+            
             if self._lookup_object(wg_group.name):
                 self.skipped_existing.append(f"[group] {wg_group.name}")
                 self.reporter.object_skipped("network_group", wg_group.name, "Already exists in FMC")
                 skipped_count += 1
                 continue
             
-            fmc_data = self._build_network_group_data(wg_group)
+            fmc_data, skipped_members = self._build_network_group_data(wg_group)
             
             if not fmc_data:
-                self.errors.append(f"Failed to build data for group {wg_group.name} (no valid members)")
-                self.reporter.group_failed(wg_group.name, "No valid members", wg_group.members)
+                reason = "No valid members"
+                if skipped_members:
+                    reason = f"No valid members (skipped {len(skipped_members)} interface refs: {skipped_members[:3]})"
+                self.errors.append(f"Failed to build data for group {wg_group.name} ({reason})")
+                self.reporter.group_failed(wg_group.name, reason, wg_group.members)
                 error_count += 1
                 continue
+            
+            # Log skipped interface members
+            if skipped_members:
+                print(f"  ℹ Group '{wg_group.name}': skipped {len(skipped_members)} interface member(s)")
             
             result = self.fmc.create_object('networkgroups', fmc_data)
             
@@ -827,12 +882,14 @@ class MigrationExecutor:
                 self.all_objects[wg_group.name] = fmc_obj
                 sanitized = self._sanitize_name(wg_group.name)
                 self.all_objects[sanitized] = fmc_obj
-                self.reporter.group_created(wg_group.name)
+                self.reporter.group_created(wg_group.name, skipped_interface_members=skipped_members)
                 created_count += 1
             
             time.sleep(0.05)
         
         print(f"\n✓ Created {created_count} network groups")
+        if interface_alias_count > 0:
+            print(f"ℹ Skipped {interface_alias_count} interface aliases (not network groups)")
         if skipped_count > 0:
             print(f"⚠ Skipped {skipped_count} (already exist)")
         if error_count > 0:
@@ -840,12 +897,25 @@ class MigrationExecutor:
         
         return True
     
-    def _build_network_group_data(self, wg_group: WatchGuardAddressGroup) -> Optional[Dict]:
-        """Build FMC API data for a network group."""
+    def _build_network_group_data(self, wg_group: WatchGuardAddressGroup) -> Tuple[Optional[Dict], List[str]]:
+        """Build FMC API data for a network group.
+        
+        Updated in v6 to skip interface members.
+        
+        Returns:
+            Tuple of (fmc_data, skipped_interface_members)
+        """
         sanitized_name = self._sanitize_name(wg_group.name)
         
         objects = []
+        skipped_interfaces = []
+        
         for member_name in wg_group.members:
+            # Check if this is an interface reference (v6)
+            if self._is_interface_reference(member_name):
+                skipped_interfaces.append(member_name)
+                continue
+            
             obj = self._lookup_object(member_name)
             if obj:
                 if obj.type == 'Url':
@@ -857,14 +927,14 @@ class MigrationExecutor:
                 })
         
         if not objects:
-            return None
+            return None, skipped_interfaces
         
         return {
             'name': sanitized_name,
             'type': 'NetworkGroup',
             'objects': objects,
             'description': wg_group.description[:200] if wg_group.description else ''
-        }
+        }, skipped_interfaces
     
     def _create_access_policy(self, acp_name: str) -> Optional[str]:
         """Create Access Control Policy."""
@@ -884,11 +954,69 @@ class MigrationExecutor:
         
         return acp_id
     
+    def _resolve_zones_for_rule(self, source_members: List[str], dest_members: List[str]) -> Tuple[List[Dict], List[Dict], List[str]]:
+        """
+        Resolve source/destination zones from interface references in a rule.
+        
+        Args:
+            source_members: Original source members from WatchGuard rule
+            dest_members: Original destination members from WatchGuard rule
+            
+        Returns:
+            Tuple of (source_zones, dest_zones, warnings)
+        """
+        source_zones = []
+        dest_zones = []
+        warnings = []
+        
+        if not self.zone_mapper:
+            return source_zones, dest_zones, warnings
+        
+        # Get source zones
+        src_zones, src_warnings = self.zone_mapper.get_zones_for_interfaces(source_members)
+        source_zones.extend(src_zones)
+        warnings.extend(src_warnings)
+        
+        # Get destination zones
+        dst_zones, dst_warnings = self.zone_mapper.get_zones_for_interfaces(dest_members)
+        dest_zones.extend(dst_zones)
+        warnings.extend(dst_warnings)
+        
+        return source_zones, dest_zones, warnings
+    
     def _resolve_rule_objects(self, fmc_rule: Dict, policy_data: Dict) -> Tuple[Dict, List[Dict]]:
-        """Resolve object names to IDs in a rule before sending to FMC."""
+        """Resolve object names to IDs in a rule before sending to FMC.
+        
+        Updated in v6 to add sourceZones and destinationZones.
+        """
         resolved_rule = dict(fmc_rule)
         warnings = []
         rule_name = fmc_rule.get('name', 'unnamed_rule')
+        
+        # Get original members for zone mapping (v6)
+        source_members_original = policy_data.get('source_members_original', [])
+        dest_members_original = policy_data.get('dest_members_original', [])
+        
+        # Resolve zones (v6)
+        source_zones, dest_zones, zone_warnings = self._resolve_zones_for_rule(
+            source_members_original, dest_members_original
+        )
+        
+        if source_zones:
+            resolved_rule['sourceZones'] = {'objects': source_zones}
+            self.rules_with_zones += 1
+        
+        if dest_zones:
+            resolved_rule['destinationZones'] = {'objects': dest_zones}
+            if not source_zones:  # Only count once
+                self.rules_with_zones += 1
+        
+        for zw in zone_warnings:
+            warnings.append({
+                'type': 'zone_mapping',
+                'message': zw
+            })
+            self.rules_with_zone_warnings += 1
         
         # Resolve source networks
         if 'sourceNetworks' in resolved_rule:
@@ -898,6 +1026,10 @@ class MigrationExecutor:
             for obj_ref in resolved_rule['sourceNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
+                    # Skip interface references (v6)
+                    if self._is_interface_reference(obj_name):
+                        continue
+                    
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
                         obj_entry = {
@@ -943,6 +1075,10 @@ class MigrationExecutor:
             for obj_ref in resolved_rule['destinationNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
+                    # Skip interface references (v6)
+                    if self._is_interface_reference(obj_name):
+                        continue
+                    
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
                         obj_entry = {
@@ -1125,6 +1261,10 @@ class MigrationExecutor:
                     )
                     if 'applications' not in missing_elements:
                         missing_elements.append('applications')
+                elif warning['type'] == 'zone_mapping':
+                    # Zone mapping warnings are informational
+                    print(f"  ⚠ [{policy_name}] zone: {warning.get('message', 'Unknown')}")
+                    continue  # Don't add to print below
                 
                 print(f"  ⚠ [{policy_name}] {warning['type']}: {warning.get('object', warning.get('application', 'Unknown'))}")
             
@@ -1152,6 +1292,10 @@ class MigrationExecutor:
             print(f"ℹ {rules_with_apps} rules have applications ({total_apps_applied} total app references)")
         if rules_with_service_groups > 0:
             print(f"ℹ {rules_with_service_groups} rules use service groups")
+        if self.rules_with_zones > 0:
+            print(f"ℹ {self.rules_with_zones} rules have zone mappings")
+        if self.rules_with_zone_warnings > 0:
+            print(f"⚠ {self.rules_with_zone_warnings} zone mapping warnings")
         if self.auto_created_groups > 0:
             print(f"ℹ Auto-created {self.auto_created_groups} network groups for rules exceeding 200 objects")
         if error_count > 0:
