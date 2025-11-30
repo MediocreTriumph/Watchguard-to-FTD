@@ -3,6 +3,8 @@ Migration Reporter - Unified reporting for WatchGuard to FMC migration.
 
 Collects all errors, warnings, and statistics during migration and
 generates a comprehensive migration_report.json file.
+
+Updated for v5 parser with service group support.
 """
 
 import json
@@ -64,6 +66,15 @@ class IncompleteRule:
     created: bool = True
 
 
+@dataclass
+class ServiceGroupCreated:
+    """Record of a created service group with details."""
+    name: str
+    port_members: int
+    icmp_members: int
+    protocol_members: int
+
+
 class MigrationReporter:
     """
     Collects and reports all migration issues.
@@ -99,6 +110,12 @@ class MigrationReporter:
         self._groups_created = 0
         self._groups_failed = 0
         self._auto_groups_created = 0
+        
+        # Service group tracking (v5)
+        self._service_groups_created = 0
+        self._service_groups_with_icmp = 0
+        self._service_groups_with_protocol = 0
+        self._service_group_details: List[ServiceGroupCreated] = []
         
         # Detailed records
         self._object_failures: List[ObjectFailure] = []
@@ -151,6 +168,23 @@ class MigrationReporter:
         """Record auto-created group for >200 object rules."""
         self._auto_groups_created += 1
         self._groups_created += 1
+    
+    def service_group_created(self, name: str, port_members: int, 
+                              icmp_members: int = 0, protocol_members: int = 0):
+        """Record successful service (port object) group creation (v5)."""
+        self._service_groups_created += 1
+        
+        if icmp_members > 0:
+            self._service_groups_with_icmp += 1
+        if protocol_members > 0:
+            self._service_groups_with_protocol += 1
+        
+        self._service_group_details.append(ServiceGroupCreated(
+            name=name,
+            port_members=port_members,
+            icmp_members=icmp_members,
+            protocol_members=protocol_members
+        ))
     
     # ========== Rule tracking ==========
     
@@ -231,6 +265,9 @@ class MigrationReporter:
             "groups_created": self._groups_created,
             "groups_failed": self._groups_failed,
             "auto_groups_created": self._auto_groups_created,
+            "service_groups_created": self._service_groups_created,
+            "service_groups_with_icmp": self._service_groups_with_icmp,
+            "service_groups_with_protocol": self._service_groups_with_protocol,
             "objects_created_by_type": dict(self._objects_created),
             "objects_skipped_by_type": dict(self._objects_skipped),
             "objects_failed_by_type": dict(self._objects_failed)
@@ -296,14 +333,32 @@ class MigrationReporter:
             ]
         }
     
+    def get_service_group_details(self) -> List[Dict]:
+        """Get details of created service groups (v5)."""
+        return [
+            {
+                "name": sg.name,
+                "port_members": sg.port_members,
+                "icmp_members": sg.icmp_members,
+                "protocol_members": sg.protocol_members
+            }
+            for sg in self._service_group_details
+        ]
+    
     def build_report(self) -> Dict[str, Any]:
         """Build the complete migration report."""
-        return {
+        report = {
             "summary": self.get_summary(),
             "errors": self.get_errors(),
             "warnings": self.get_warnings(),
             "detailed_failures": self.get_detailed_failures()
         }
+        
+        # Include service group details if any were created (v5)
+        if self._service_group_details:
+            report["service_groups"] = self.get_service_group_details()
+        
+        return report
     
     def save_report(self, directory: str = ".") -> str:
         """
@@ -338,11 +393,23 @@ class MigrationReporter:
               f"{summary['objects_skipped']} skipped, {summary['objects_failed']} failed")
         
         if summary['groups_created'] > 0 or summary['groups_failed'] > 0:
-            print(f"   Groups: {summary['groups_created']} created", end="")
+            print(f"   Network Groups: {summary['groups_created']} created", end="")
             if summary['auto_groups_created'] > 0:
                 print(f" ({summary['auto_groups_created']} auto-generated)", end="")
             if summary['groups_failed'] > 0:
                 print(f", {summary['groups_failed']} failed", end="")
+            print()
+        
+        # Service groups (v5)
+        if summary['service_groups_created'] > 0:
+            print(f"   Service Groups: {summary['service_groups_created']} created", end="")
+            notes = []
+            if summary['service_groups_with_icmp'] > 0:
+                notes.append(f"{summary['service_groups_with_icmp']} with ICMP")
+            if summary['service_groups_with_protocol'] > 0:
+                notes.append(f"{summary['service_groups_with_protocol']} with protocol-only")
+            if notes:
+                print(f" ({', '.join(notes)})", end="")
             print()
         
         errors = report["errors"]

@@ -1,13 +1,16 @@
 """
 Migration Planner - Creates migration plan with proper alias resolution.
+
+Updated for v5 parser with service group support.
 """
 
-from typing import Dict, List, Set, Any, Optional
+from typing import Dict, List, Set, Any, Optional, Tuple
 from dataclasses import dataclass, field
 import json
 from models import (
     WatchGuardConfig, WatchGuardPolicy, WatchGuardAddress, 
-    WatchGuardAddressGroup, WatchGuardService, WatchGuardAppAction, FMCObject
+    WatchGuardAddressGroup, WatchGuardService, WatchGuardServiceGroup,
+    WatchGuardAppAction, FMCObject
 )
 
 
@@ -20,6 +23,9 @@ class MigrationPlan:
     objects_to_create: List[Dict]
     policies_to_create: List[Dict]
     statistics: Dict[str, int]
+    
+    # Service group support (v5)
+    service_groups_to_create: List[WatchGuardServiceGroup] = field(default_factory=list)
     
     @property
     def total_wg_objects(self):
@@ -145,11 +151,59 @@ class MigrationPlanner:
         
         self.address_groups = {g.name: g for g in self.wg_config.address_groups}
         
+        # =====================================================================
+        # Service lookups (updated for v5 with service groups)
+        # =====================================================================
+        
+        # Individual services by unique name (e.g., "PDQ_TCP_139")
+        self.services_by_name: Dict[str, WatchGuardService] = {}
+        
+        # Service groups by original name (e.g., "PDQ" -> WatchGuardServiceGroup)
+        self.service_groups_by_original: Dict[str, WatchGuardServiceGroup] = {}
+        
+        # Map original service name -> group name OR individual service name
+        # This is the primary lookup for policy resolution
+        self.service_lookup: Dict[str, Dict[str, Any]] = {}
+        
+        # First, index service groups by their original name
+        for group in self.wg_config.service_groups:
+            self.service_groups_by_original[group.original_name] = group
+            self.service_lookup[group.original_name] = {
+                'type': 'group',
+                'group': group
+            }
+        
+        # Index all individual services by unique name
+        all_services = (
+            self.wg_config.tcp_services +
+            self.wg_config.udp_services +
+            self.wg_config.icmp_services +
+            getattr(self.wg_config, 'protocol_only_services', []) +
+            getattr(self.wg_config, 'other_services', [])
+        )
+        
+        for svc in all_services:
+            self.services_by_name[svc.name] = svc
+            
+            # For services NOT part of a group, also index by original_name
+            original = svc.original_name or svc.name
+            if original not in self.service_lookup:
+                self.service_lookup[original] = {
+                    'type': 'service',
+                    'service': svc
+                }
+        
+        # Legacy: flat services dict for backward compatibility
         self.services = {}
         for tcp in self.wg_config.tcp_services:
-            self.services[tcp.name] = tcp
+            # Use original_name for policy lookup compatibility
+            original = tcp.original_name or tcp.name
+            if original not in self.service_groups_by_original:
+                self.services[original] = tcp
         for udp in self.wg_config.udp_services:
-            self.services[udp.name] = udp
+            original = udp.original_name or udp.name
+            if original not in self.service_groups_by_original:
+                self.services[original] = udp
         
         # URL objects list for creation
         self.url_objects = []
@@ -167,6 +221,8 @@ class MigrationPlanner:
         print(f"  Identified {len(self.wildcard_fqdns)} wildcard FQDNs (will be URL objects)")
         print(f"  Identified {len(self.host_networks)} /32 networks (will be Host objects)")
         print(f"  Loaded {len(self.app_actions)} application action definitions")
+        print(f"  Indexed {len(self.services_by_name)} individual services")
+        print(f"  Indexed {len(self.service_groups_by_original)} service groups")
     
     def _get_app_action_by_name(self, name: str) -> Optional[WatchGuardAppAction]:
         """Look up an app_action by name."""
@@ -201,6 +257,20 @@ class MigrationPlanner:
             resolved.extend(self.resolve_alias_to_objects(alias_ref, visited))
         
         return list(set(resolved))
+    
+    def resolve_service(self, service_name: str) -> Dict[str, Any]:
+        """
+        Resolve a WatchGuard service name to either a service group or individual service.
+        
+        Returns:
+            Dict with 'type' key:
+            - type='group': Contains 'group' (WatchGuardServiceGroup)
+            - type='service': Contains 'service' (WatchGuardService)
+            - type='not_found': Service doesn't exist
+        """
+        if service_name in self.service_lookup:
+            return self.service_lookup[service_name]
+        return {'type': 'not_found', 'name': service_name}
     
     def _get_app_mappings(self) -> Dict[str, FMCObject]:
         """Get application mappings from app_mapper."""
@@ -248,6 +318,7 @@ class MigrationPlanner:
         
         objects_to_create = []
         policies_to_create = []
+        service_groups_to_create = []
         
         print("\nMapping address objects...")
         for name, obj in self.address_objects.items():
@@ -256,13 +327,24 @@ class MigrationPlanner:
             objects_to_create.append({'type': actual_type, 'wg_object': obj})
         
         print("\nMapping services...")
-        for name, obj in self.services.items():
+        # Add individual services that need creation
+        for name, svc in self.services_by_name.items():
+            # Check if this service (by its unique name) already exists via canonical mapping
             if name not in service_mappings:
-                objects_to_create.append({'type': 'service', 'wg_object': obj})
+                # Also check by original name
+                original = svc.original_name or name
+                if original not in service_mappings:
+                    objects_to_create.append({'type': 'service', 'wg_object': svc})
+        
+        print("\nMapping service groups...")
+        # Add service groups that need creation
+        for original_name, group in self.service_groups_by_original.items():
+            if group.needs_port_group:
+                service_groups_to_create.append(group)
+        
+        print(f"  Service groups to create: {len(service_groups_to_create)}")
         
         print("\nProcessing URL objects...")
-        # Note: wildcard FQDNs are already added with type='url' in the loop above
-        # The url_objects list is now redundant but kept for backwards compatibility
         print(f"  Found {len(self.url_objects)} wildcard URLs to create as URL objects")
         
         print("\nIdentifying objects to create...")
@@ -275,6 +357,7 @@ class MigrationPlanner:
         policies_with_issues = 0
         policies_with_warnings = 0
         policies_with_apps = 0
+        policies_with_service_groups = 0
         
         for policy in self.wg_config.policies:
             policy_plan, issues = self._plan_policy(policy, address_mappings, 
@@ -285,11 +368,14 @@ class MigrationPlanner:
                 policies_with_warnings += 1
             if policy_plan.get('fmc_rule', {}).get('applications'):
                 policies_with_apps += 1
+            if policy_plan.get('uses_service_group'):
+                policies_with_service_groups += 1
             policies_to_create.append(policy_plan)
         
         print(f"  Total policies: {len(self.wg_config.policies)}")
         print(f"  With issues: {policies_with_issues}")
         print(f"  With applications: {policies_with_apps}")
+        print(f"  With service groups: {policies_with_service_groups}")
         
         statistics = {
             'total_wg_objects': len(self.address_objects),
@@ -300,7 +386,9 @@ class MigrationPlanner:
             'policies_with_issues': policies_with_issues,
             'policies_with_warnings': policies_with_warnings,
             'policies_with_errors': policies_with_issues,
-            'policies_with_applications': policies_with_apps
+            'policies_with_applications': policies_with_apps,
+            'policies_with_service_groups': policies_with_service_groups,
+            'service_groups_to_create': len(service_groups_to_create)
         }
         
         return MigrationPlan(
@@ -309,12 +397,13 @@ class MigrationPlanner:
             application_mappings=application_mappings,
             objects_to_create=objects_to_create,
             policies_to_create=policies_to_create,
-            statistics=statistics
+            statistics=statistics,
+            service_groups_to_create=service_groups_to_create
         )
     
     def _plan_policy(self, policy: WatchGuardPolicy, address_mappings: Dict,
-                     service_mappings: Dict, application_mappings: Dict) -> tuple:
-        """Plan policy with alias resolution."""
+                     service_mappings: Dict, application_mappings: Dict) -> Tuple[Dict, List]:
+        """Plan policy with alias resolution and service group support."""
         issues = []
         warnings = []
         
@@ -346,28 +435,165 @@ class MigrationPlanner:
                         'name': name
                     })
         
-        # Services
-        service_objects = []
+        # =====================================================================
+        # Resolve services (updated for v5 with service groups)
+        # =====================================================================
+        service_objects = []          # TCP/UDP port objects or port groups
+        icmp_objects = []             # ICMP objects (separate from port groups)
+        protocol_objects = []         # Protocol-only (GRE, ESP) - use literal
+        uses_service_group = False
+        service_group_name = None
+        
         if policy.service and policy.service != 'Any':
-            if policy.service in service_mappings:
-                obj = service_mappings[policy.service]
-                service_objects.append({
-                    'type': obj.type,
-                    'id': obj.id,
-                    'name': obj.name
-                })
-            elif policy.service in self.services:
-                wg_svc = self.services[policy.service]
-                warnings.append(f"Service '{policy.service}' needs to be created")
-                service_objects.append({
-                    'type': 'ProtocolPortObject',
-                    'name': policy.service,
-                    'protocol': wg_svc.protocol,
-                    'port': wg_svc.port,
-                    'needs_creation': True
-                })
-            else:
-                warnings.append(f"Service '{policy.service}' not found")
+            resolved = self.resolve_service(policy.service)
+            
+            if resolved['type'] == 'group':
+                # Service maps to a group
+                group: WatchGuardServiceGroup = resolved['group']
+                uses_service_group = True
+                service_group_name = group.name
+                
+                # If group has 2+ TCP/UDP members, use the port group
+                if group.needs_port_group:
+                    # Reference the port group (will be created in executor)
+                    service_objects.append({
+                        'type': 'PortObjectGroup',
+                        'name': group.name,
+                        'needs_creation': True,
+                        'is_service_group': True
+                    })
+                else:
+                    # Single TCP/UDP member - reference it directly
+                    for member_name in group.members:
+                        svc = self.services_by_name.get(member_name)
+                        if svc:
+                            # Check if it's mapped to existing FMC object
+                            if member_name in service_mappings:
+                                obj = service_mappings[member_name]
+                                service_objects.append({
+                                    'type': obj.type,
+                                    'id': obj.id,
+                                    'name': obj.name
+                                })
+                            else:
+                                service_objects.append({
+                                    'type': 'ProtocolPortObject',
+                                    'name': member_name,
+                                    'protocol': svc.protocol,
+                                    'port': svc.port,
+                                    'needs_creation': True
+                                })
+                
+                # Handle ICMP members (must be added separately)
+                for icmp_name in group.icmp_members:
+                    svc = self.services_by_name.get(icmp_name)
+                    if svc:
+                        icmp_version = getattr(svc, 'icmp_version', 'v4')
+                        icmp_type = 'ICMPV6Object' if icmp_version == 'v6' else 'ICMPV4Object'
+                        icmp_objects.append({
+                            'type': icmp_type,
+                            'name': icmp_name,
+                            'needs_creation': True
+                        })
+                
+                # Handle protocol-only members (GRE, ESP, etc.)
+                for proto_name in group.protocol_members:
+                    svc = self.services_by_name.get(proto_name)
+                    if svc:
+                        protocol_num = getattr(svc, 'protocol_number', None)
+                        protocol_objects.append({
+                            'type': 'ProtocolLiteral',
+                            'name': proto_name,
+                            'protocol': svc.protocol,
+                            'protocol_number': protocol_num
+                        })
+                
+                # Log group warnings
+                if group.warnings:
+                    for w in group.warnings:
+                        warnings.append(f"Service group '{group.original_name}': {w}")
+                
+                # Informational notes
+                if group.icmp_members:
+                    warnings.append(f"Service '{policy.service}' includes ICMP ({len(group.icmp_members)} objects) - added separately")
+                if group.protocol_members:
+                    warnings.append(f"Service '{policy.service}' includes protocol-only ({len(group.protocol_members)} objects) - require special handling")
+            
+            elif resolved['type'] == 'service':
+                # Single service (not in a group)
+                svc: WatchGuardService = resolved['service']
+                
+                if svc.is_port_based:
+                    # TCP/UDP service
+                    if policy.service in service_mappings:
+                        obj = service_mappings[policy.service]
+                        service_objects.append({
+                            'type': obj.type,
+                            'id': obj.id,
+                            'name': obj.name
+                        })
+                    elif svc.name in service_mappings:
+                        obj = service_mappings[svc.name]
+                        service_objects.append({
+                            'type': obj.type,
+                            'id': obj.id,
+                            'name': obj.name
+                        })
+                    else:
+                        warnings.append(f"Service '{policy.service}' needs to be created")
+                        service_objects.append({
+                            'type': 'ProtocolPortObject',
+                            'name': svc.name,
+                            'protocol': svc.protocol,
+                            'port': svc.port,
+                            'needs_creation': True
+                        })
+                
+                elif svc.is_icmp:
+                    # ICMP service
+                    icmp_version = getattr(svc, 'icmp_version', 'v4')
+                    icmp_type = 'ICMPV6Object' if icmp_version == 'v6' else 'ICMPV4Object'
+                    icmp_objects.append({
+                        'type': icmp_type,
+                        'name': svc.name,
+                        'needs_creation': True
+                    })
+                
+                elif svc.is_protocol_only:
+                    # Protocol-only (GRE, ESP, etc.)
+                    protocol_num = getattr(svc, 'protocol_number', None)
+                    protocol_objects.append({
+                        'type': 'ProtocolLiteral',
+                        'name': svc.name,
+                        'protocol': svc.protocol,
+                        'protocol_number': protocol_num
+                    })
+                
+                else:
+                    # Other/unsupported
+                    warnings.append(f"Service '{policy.service}' has unsupported protocol '{svc.protocol}'")
+            
+            elif resolved['type'] == 'not_found':
+                # Try legacy lookup
+                if policy.service in service_mappings:
+                    obj = service_mappings[policy.service]
+                    service_objects.append({
+                        'type': obj.type,
+                        'id': obj.id,
+                        'name': obj.name
+                    })
+                elif policy.service in self.services:
+                    wg_svc = self.services[policy.service]
+                    warnings.append(f"Service '{policy.service}' needs to be created")
+                    service_objects.append({
+                        'type': 'ProtocolPortObject',
+                        'name': policy.service,
+                        'protocol': wg_svc.protocol,
+                        'port': wg_svc.port,
+                        'needs_creation': True
+                    })
+                else:
+                    warnings.append(f"Service '{policy.service}' not found")
         
         # Applications - resolve from app_action reference
         application_objects = []
@@ -415,9 +641,6 @@ class MigrationPlanner:
         # Note URL objects
         if source_url_count > 0:
             warnings.append(f"Rule has {source_url_count} source URL objects (FMC doesn't support source URLs)")
-        if dest_url_count > 0:
-            # This is informational, not a warning - URLs are supported in destinations
-            pass
         
         # Build FMC rule
         action = self._map_action(policy.action)
@@ -443,10 +666,35 @@ class MigrationPlanner:
             fmc_rule['sourceNetworks'] = {'objects': source_objects}
         if dest_objects:
             fmc_rule['destinationNetworks'] = {'objects': dest_objects}
+        
+        # Add port objects (TCP/UDP and port groups)
         if service_objects:
             valid_services = [s for s in service_objects if 'id' in s and not s.get('needs_creation')]
-            if valid_services:
-                fmc_rule['destinationPorts'] = {'objects': valid_services}
+            needs_creation = [s for s in service_objects if s.get('needs_creation')]
+            
+            if valid_services or needs_creation:
+                fmc_rule['destinationPorts'] = {'objects': valid_services + needs_creation}
+        
+        # Add ICMP objects (separate from port objects)
+        if icmp_objects:
+            # ICMP goes in destinationPorts but as separate objects
+            if 'destinationPorts' not in fmc_rule:
+                fmc_rule['destinationPorts'] = {'objects': []}
+            fmc_rule['destinationPorts']['objects'].extend(icmp_objects)
+        
+        # Add protocol-only objects (GRE, ESP, etc.)
+        if protocol_objects:
+            # These need to be handled as literals in the rule
+            if 'destinationPorts' not in fmc_rule:
+                fmc_rule['destinationPorts'] = {'objects': [], 'literals': []}
+            if 'literals' not in fmc_rule['destinationPorts']:
+                fmc_rule['destinationPorts']['literals'] = []
+            
+            for proto in protocol_objects:
+                fmc_rule['destinationPorts']['literals'].append({
+                    'type': 'ProtocolPortObject',
+                    'protocol': proto['protocol_number'] or proto['protocol']
+                })
         
         # Add applications if any were resolved
         if application_objects:
@@ -463,7 +711,11 @@ class MigrationPlanner:
             'service_original': policy.service,
             'app_action_original': policy.app_action,
             'applications_mapped': len(application_objects),
-            'applications_unmapped': unmapped_apps
+            'applications_unmapped': unmapped_apps,
+            'uses_service_group': uses_service_group,
+            'service_group_name': service_group_name,
+            'icmp_objects': icmp_objects,
+            'protocol_objects': protocol_objects
         }, issues
     
     def _map_action(self, wg_action: str) -> str:

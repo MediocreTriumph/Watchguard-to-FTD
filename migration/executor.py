@@ -1,6 +1,8 @@
 """
 Migration executor - creates objects and policies in FMC.
 Enhanced with unified reporting via MigrationReporter.
+
+Updated for v5 parser with service group support.
 """
 
 import time
@@ -9,7 +11,7 @@ import json
 import os
 from typing import Dict, List, Any, Optional, Set, Tuple
 from models import (
-    WatchGuardAddress, WatchGuardService, 
+    WatchGuardAddress, WatchGuardService, WatchGuardServiceGroup,
     WatchGuardAddressGroup, FMCObject
 )
 from fmc.client import FMCClient
@@ -36,6 +38,9 @@ class MigrationExecutor:
         self.used_names: Set[str] = set()
         self.auto_created_groups: int = 0
         
+        # Service group tracking (v5)
+        self.created_service_groups: Dict[str, FMCObject] = {}
+        
         # Unified reporter
         self.reporter = MigrationReporter()
         
@@ -60,6 +65,12 @@ class MigrationExecutor:
                 self.all_objects[name] = obj
             if hasattr(self.fmc_discovery, 'url_objects'):
                 for name, obj in self.fmc_discovery.url_objects.items():
+                    self.all_objects[name] = obj
+            if hasattr(self.fmc_discovery, 'port_object_groups'):
+                for name, obj in self.fmc_discovery.port_object_groups.items():
+                    self.all_objects[name] = obj
+            if hasattr(self.fmc_discovery, 'icmp_objects'):
+                for name, obj in self.fmc_discovery.icmp_objects.items():
                     self.all_objects[name] = obj
         
         if hasattr(self.plan, 'service_mappings'):
@@ -113,6 +124,10 @@ class MigrationExecutor:
         
         if name in self.created_objects:
             return self.created_objects[name]
+        
+        # Check created service groups
+        if name in self.created_service_groups:
+            return self.created_service_groups[name]
         
         sanitized = self._sanitize_name(name, track=False)
         if sanitized in self.all_objects:
@@ -215,6 +230,14 @@ class MigrationExecutor:
             success = False
         
         if not self._create_service_objects():
+            success = False
+        
+        # Create ICMP objects (v5)
+        if not self._create_icmp_objects():
+            success = False
+        
+        # Create service (port) groups (v5)
+        if not self._create_service_groups():
             success = False
         
         if not self._create_network_groups():
@@ -462,9 +485,9 @@ class MigrationExecutor:
         return None
     
     def _create_service_objects(self) -> bool:
-        """Create service objects for unmapped services."""
+        """Create service objects for unmapped services (TCP/UDP only)."""
         print("\n" + "-"*60)
-        print("Creating Service Objects")
+        print("Creating Service Objects (TCP/UDP)")
         print("-"*60)
         
         created_count = 0
@@ -476,6 +499,10 @@ class MigrationExecutor:
                 continue
             
             wg_svc: WatchGuardService = obj_def['wg_object']
+            
+            # Skip non-TCP/UDP services (handled separately)
+            if wg_svc.protocol not in ['TCP', 'UDP']:
+                continue
             
             if self._lookup_object(wg_svc.name):
                 self.skipped_existing.append(f"[service] {wg_svc.name}")
@@ -528,6 +555,199 @@ class MigrationExecutor:
         
         return True
     
+    def _create_icmp_objects(self) -> bool:
+        """Create ICMP objects (v5)."""
+        print("\n" + "-"*60)
+        print("Creating ICMP Objects")
+        print("-"*60)
+        
+        created_count = 0
+        error_count = 0
+        skipped_count = 0
+        
+        for obj_def in self.plan.objects_to_create:
+            if obj_def['type'] != 'service':
+                continue
+            
+            wg_svc: WatchGuardService = obj_def['wg_object']
+            
+            # Only process ICMP services
+            if wg_svc.protocol not in ['ICMP', 'ICMPv6']:
+                continue
+            
+            if self._lookup_object(wg_svc.name):
+                self.skipped_existing.append(f"[icmp] {wg_svc.name}")
+                self.reporter.object_skipped("icmp", wg_svc.name, "Already exists in FMC")
+                skipped_count += 1
+                continue
+            
+            sanitized_name = self._sanitize_name(wg_svc.name)
+            
+            # Determine ICMP version
+            icmp_version = getattr(wg_svc, 'icmp_version', 'v4')
+            if wg_svc.protocol == 'ICMPv6':
+                icmp_version = 'v6'
+            
+            if icmp_version == 'v6':
+                fmc_type = 'icmpv6objects'
+                obj_type = 'ICMPV6Object'
+            else:
+                fmc_type = 'icmpv4objects'
+                obj_type = 'ICMPV4Object'
+            
+            fmc_data = {
+                'name': sanitized_name,
+                'type': obj_type,
+                'icmpType': 'Any',  # WatchGuard doesn't specify type/code
+                'description': wg_svc.description[:200] if wg_svc.description else ''
+            }
+            
+            result = self.fmc.create_object(fmc_type, fmc_data)
+            
+            if 'error' in result:
+                error_text = result.get('error', 'Unknown error')
+                if self._is_already_exists_error(error_text):
+                    self.skipped_existing.append(f"[icmp] {wg_svc.name}")
+                    self.reporter.object_skipped("icmp", wg_svc.name, "Already exists in FMC")
+                    skipped_count += 1
+                else:
+                    self.errors.append(f"Failed to create ICMP {wg_svc.name}: {error_text}")
+                    self.reporter.object_failed("icmp", wg_svc.name, error_text, fmc_data)
+                    error_count += 1
+            else:
+                fmc_obj = FMCObject(
+                    id=result['id'],
+                    name=result['name'],
+                    type=result['type']
+                )
+                self.created_objects[wg_svc.name] = fmc_obj
+                self.all_objects[wg_svc.name] = fmc_obj
+                self.all_objects[sanitized_name] = fmc_obj
+                self.reporter.object_created("icmp", wg_svc.name)
+                created_count += 1
+            
+            time.sleep(0.05)
+        
+        print(f"\n✓ Created {created_count} ICMP objects")
+        if skipped_count > 0:
+            print(f"⚠ Skipped {skipped_count} (already exist)")
+        if error_count > 0:
+            print(f"✗ {error_count} errors")
+        
+        return True
+    
+    def _create_service_groups(self) -> bool:
+        """Create service (port object) groups from v5 parser output."""
+        print("\n" + "-"*60)
+        print("Creating Service Groups (Port Object Groups)")
+        print("-"*60)
+        
+        service_groups = getattr(self.plan, 'service_groups_to_create', [])
+        
+        if not service_groups:
+            print("  No service groups to create")
+            return True
+        
+        created_count = 0
+        error_count = 0
+        skipped_count = 0
+        
+        for group in service_groups:
+            group_name = group.name
+            
+            # Check if group already exists
+            if self._lookup_object(group_name):
+                self.skipped_existing.append(f"[service_group] {group_name}")
+                self.reporter.object_skipped("service_group", group_name, "Already exists in FMC")
+                skipped_count += 1
+                continue
+            
+            # Build member objects list (TCP/UDP only - ICMP cannot be in port groups)
+            member_objects = []
+            missing_members = []
+            
+            for member_name in group.members:
+                member_obj = self._lookup_object(member_name)
+                if member_obj:
+                    member_objects.append({
+                        'type': member_obj.type,
+                        'id': member_obj.id,
+                        'name': member_obj.name
+                    })
+                else:
+                    missing_members.append(member_name)
+            
+            if missing_members:
+                print(f"  ⚠ Group '{group_name}': {len(missing_members)} members not found: {missing_members[:5]}...")
+            
+            if not member_objects:
+                self.errors.append(f"Service group '{group_name}' has no valid members")
+                self.reporter.group_failed(group_name, "No valid members found", group.members)
+                error_count += 1
+                continue
+            
+            sanitized_name = self._sanitize_name(group_name)
+            
+            # Build description with info about ICMP/protocol members
+            desc_parts = [f"Service group for {group.original_name}"]
+            if group.icmp_members:
+                desc_parts.append(f"ICMP: {len(group.icmp_members)} (separate)")
+            if group.protocol_members:
+                desc_parts.append(f"Protocol: {len(group.protocol_members)}")
+            description = " | ".join(desc_parts)[:200]
+            
+            fmc_data = {
+                'name': sanitized_name,
+                'type': 'PortObjectGroup',
+                'objects': member_objects,
+                'description': description
+            }
+            
+            result = self.fmc.create_object('portobjectgroups', fmc_data)
+            
+            if 'error' in result:
+                error_text = result.get('error', 'Unknown error')
+                if self._is_already_exists_error(error_text):
+                    self.skipped_existing.append(f"[service_group] {group_name}")
+                    self.reporter.object_skipped("service_group", group_name, "Already exists in FMC")
+                    skipped_count += 1
+                else:
+                    self.errors.append(f"Failed to create service group {group_name}: {error_text}")
+                    self.reporter.group_failed(group_name, error_text, group.members)
+                    error_count += 1
+            else:
+                fmc_obj = FMCObject(
+                    id=result['id'],
+                    name=result['name'],
+                    type='PortObjectGroup'
+                )
+                self.created_service_groups[group_name] = fmc_obj
+                self.all_objects[group_name] = fmc_obj
+                self.all_objects[sanitized_name] = fmc_obj
+                
+                # Report with details about non-port members
+                self.reporter.service_group_created(
+                    group_name, 
+                    len(member_objects),
+                    len(group.icmp_members),
+                    len(group.protocol_members)
+                )
+                created_count += 1
+                
+                # Log warnings from the group
+                for warning in group.warnings:
+                    print(f"  ⚠ [{group_name}] {warning}")
+            
+            time.sleep(0.05)
+        
+        print(f"\n✓ Created {created_count} service groups")
+        if skipped_count > 0:
+            print(f"⚠ Skipped {skipped_count} (already exist)")
+        if error_count > 0:
+            print(f"✗ {error_count} errors")
+        
+        return True
+    
     def _build_service_object_data(self, wg_svc: WatchGuardService) -> Optional[Dict]:
         """Build FMC API data for a service object."""
         sanitized_name = self._sanitize_name(wg_svc.name)
@@ -549,7 +769,7 @@ class MigrationExecutor:
                 'data': {
                     'name': sanitized_name,
                     'type': 'ICMPV4Object',
-                    'icmpType': 'ANY',
+                    'icmpType': 'Any',
                     'description': wg_svc.description[:200] if wg_svc.description else ''
                 }
             }
@@ -761,12 +981,50 @@ class MigrationExecutor:
             if resolved_dest_urls:
                 resolved_rule['urls'] = {'objects': resolved_dest_urls}
         
-        # Resolve services
+        # Resolve services (updated for v5 with service groups, ICMP, protocol-only)
         if 'destinationPorts' in resolved_rule:
             resolved_ports = []
+            resolved_literals = []
+            
+            # Handle objects (TCP/UDP port objects and port groups)
             for obj_ref in resolved_rule['destinationPorts'].get('objects', []):
-                if 'id' in obj_ref:
+                if 'id' in obj_ref and not obj_ref.get('needs_creation'):
+                    # Already resolved
                     resolved_ports.append(obj_ref)
+                elif obj_ref.get('is_service_group'):
+                    # Service group - look it up
+                    group_name = obj_ref.get('name')
+                    fmc_obj = self._lookup_object(group_name)
+                    if fmc_obj:
+                        resolved_ports.append({
+                            'type': fmc_obj.type,
+                            'id': fmc_obj.id,
+                            'name': fmc_obj.name
+                        })
+                    else:
+                        warnings.append({
+                            'type': 'unresolved',
+                            'object': group_name,
+                            'field': 'service_group',
+                            'reason': 'Service group not found in FMC'
+                        })
+                elif obj_ref.get('type') in ['ICMPV4Object', 'ICMPV6Object']:
+                    # ICMP object - look it up
+                    obj_name = obj_ref.get('name')
+                    fmc_obj = self._lookup_object(obj_name)
+                    if fmc_obj:
+                        resolved_ports.append({
+                            'type': fmc_obj.type,
+                            'id': fmc_obj.id,
+                            'name': fmc_obj.name
+                        })
+                    else:
+                        warnings.append({
+                            'type': 'unresolved',
+                            'object': obj_name,
+                            'field': 'icmp',
+                            'reason': 'ICMP object not found in FMC'
+                        })
                 else:
                     obj_name = obj_ref.get('name')
                     if obj_name:
@@ -785,8 +1043,17 @@ class MigrationExecutor:
                                 'reason': 'Not found in FMC'
                             })
             
-            if resolved_ports:
-                resolved_rule['destinationPorts'] = {'objects': resolved_ports}
+            # Handle literals (protocol-only like GRE, ESP)
+            for literal in resolved_rule['destinationPorts'].get('literals', []):
+                resolved_literals.append(literal)
+            
+            # Build final destinationPorts
+            if resolved_ports or resolved_literals:
+                resolved_rule['destinationPorts'] = {}
+                if resolved_ports:
+                    resolved_rule['destinationPorts']['objects'] = resolved_ports
+                if resolved_literals:
+                    resolved_rule['destinationPorts']['literals'] = resolved_literals
             else:
                 del resolved_rule['destinationPorts']
         
@@ -811,6 +1078,7 @@ class MigrationExecutor:
         created_count = 0
         error_count = 0
         rules_with_apps = 0
+        rules_with_service_groups = 0
         total_apps_applied = 0
         
         for idx, policy_data in enumerate(self.plan.policies_to_create):
@@ -829,6 +1097,9 @@ class MigrationExecutor:
                     rules_with_apps += 1
                     total_apps_applied += app_count
             
+            if policy_data.get('uses_service_group'):
+                rules_with_service_groups += 1
+            
             resolved_rule, rule_warnings = self._resolve_rule_objects(fmc_rule, policy_data)
             
             has_warnings = len(rule_warnings) > 0
@@ -845,7 +1116,7 @@ class MigrationExecutor:
                         missing_elements.append('source_networks')
                     elif field == 'destination' and 'destination_networks' not in missing_elements:
                         missing_elements.append('destination_networks')
-                    elif field == 'service' and 'services' not in missing_elements:
+                    elif field in ['service', 'service_group', 'icmp'] and 'services' not in missing_elements:
                         missing_elements.append('services')
                 elif warning['type'] == 'unmapped_app':
                     self.reporter.rule_warning_unmapped_app(
@@ -879,6 +1150,8 @@ class MigrationExecutor:
         print(f"\n✓ Created {created_count} access rules")
         if rules_with_apps > 0:
             print(f"ℹ {rules_with_apps} rules have applications ({total_apps_applied} total app references)")
+        if rules_with_service_groups > 0:
+            print(f"ℹ {rules_with_service_groups} rules use service groups")
         if self.auto_created_groups > 0:
             print(f"ℹ Auto-created {self.auto_created_groups} network groups for rules exceeding 200 objects")
         if error_count > 0:
