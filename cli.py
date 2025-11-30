@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 WatchGuard to Cisco FTD Migration Tool - CLI Entry Point
+
+Updated for v6 with interface discovery and zone mapping.
 """
 
 import sys
@@ -13,6 +15,7 @@ from models import WatchGuardConfig
 from fmc.client import FMCClient
 from fmc.discovery import FMCDiscovery
 from fmc.canonical import CanonicalPortMapper
+from fmc.zones import ZoneMapper
 from analysis.service_mapper import ServiceMapper
 from analysis.app_mapper import ApplicationMapper
 from migration.planner import MigrationPlanner
@@ -33,6 +36,11 @@ Examples:
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
       --fmc-user admin --fmc-pass password --execute \\
       --new-acp "Migrated-WG-Policy"
+      
+  # Execute with zone mapping (assumes INSIDE/OUTSIDE zones exist)
+  python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
+      --fmc-user admin --fmc-pass password --execute \\
+      --new-acp "Migrated-WG-Policy" --enable-zones
         '''
     )
     
@@ -54,6 +62,10 @@ Examples:
     parser.add_argument('--dry-run', action='store_true', default=True,
                        help='Dry run mode - build plan but don\'t create objects')
     
+    # Zone mapping options (v6)
+    parser.add_argument('--enable-zones', action='store_true',
+                       help='Enable interface-to-zone mapping (requires INSIDE/OUTSIDE zones in FMC)')
+    
     # Matching options
     parser.add_argument('--app-confidence', type=float, default=0.85,
                        help='Application matching confidence threshold (default: 0.85)')
@@ -74,7 +86,7 @@ Examples:
     
     # Run migration
     try:
-        success = run_migration(config)
+        success = run_migration(config, enable_zones=args.enable_zones)
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Migration failed: {e}")
@@ -83,7 +95,7 @@ Examples:
         sys.exit(1)
 
 
-def run_migration(config: MigrationConfig) -> bool:
+def run_migration(config: MigrationConfig, enable_zones: bool = False) -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -93,6 +105,8 @@ def run_migration(config: MigrationConfig) -> bool:
     print(f"Source: {config.watchguard_config_file}")
     print(f"Target: {config.fmc_host}")
     print(f"New ACP: {config.new_acp_name}")
+    if enable_zones:
+        print(f"Zone Mapping: ENABLED")
     
     # Step 1: Load WatchGuard configuration
     print("\n" + "="*60)
@@ -113,6 +127,14 @@ def run_migration(config: MigrationConfig) -> bool:
     print(f"  UDP Services:   {len(wg_config.udp_services)}")
     print(f"  Policies:       {len(wg_config.policies)}")
     print(f"  App Actions:    {len(wg_config.app_actions)}")
+    
+    # Check for interfaces in the config
+    interfaces_count = len(wg_data.get('interfaces', []))
+    interface_aliases_count = len(wg_data.get('interface_aliases', []))
+    if interfaces_count > 0:
+        print(f"  Interfaces:     {interfaces_count}")
+    if interface_aliases_count > 0:
+        print(f"  Interface Aliases: {interface_aliases_count}")
     
     # Step 2: Connect to FMC
     print("\n" + "="*60)
@@ -140,6 +162,34 @@ def run_migration(config: MigrationConfig) -> bool:
     
     discovery = FMCDiscovery(fmc_client)
     fmc_objects = discovery.discover_all()
+    
+    # Step 3.5: Zone Mapping (v6) - if enabled
+    zone_mapper = None
+    if enable_zones:
+        print("\n" + "="*60)
+        print("STEP 3.5: INTERFACE AND ZONE MAPPING")
+        print("="*60)
+        
+        zone_mapper = ZoneMapper(fmc_client)
+        
+        # Discover FMC zones
+        zones_ok = zone_mapper.discover_fmc_zones()
+        if not zones_ok:
+            print("  ⚠ Expected zones (INSIDE/OUTSIDE) not found - zone mapping may be incomplete")
+        
+        # Parse WatchGuard interfaces
+        if interfaces_count > 0:
+            zone_mapper.parse_wg_interfaces(wg_data)
+            zone_mapper.build_zone_mappings()
+        else:
+            print("  ⚠ No interfaces found in WatchGuard config - zone mapping skipped")
+        
+        # Parse interface aliases
+        if interface_aliases_count > 0:
+            zone_mapper.parse_interface_aliases(wg_data)
+        
+        # Print summary
+        zone_mapper.print_summary()
     
     # Step 4: Build canonical port mappings
     print("\n" + "="*60)
@@ -196,7 +246,7 @@ def run_migration(config: MigrationConfig) -> bool:
     print("="*60)
     
     plan_file = "migration_plan.json"
-    save_migration_plan(plan, plan_file)
+    save_migration_plan(plan, plan_file, zone_mapper)
     print(f"\n✓ Migration plan saved to: {plan_file}")
     
     # Show application mapping summary
@@ -218,14 +268,15 @@ def run_migration(config: MigrationConfig) -> bool:
     print("="*60)
     print("\n⚠  This will create objects in FMC")
     
-    # Pass fmc_objects to executor for ID resolution
-    executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects)
+    # Pass fmc_objects and zone_mapper to executor
+    executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
+                                  zone_mapper=zone_mapper)
     success = executor.execute(config.new_acp_name)
     
     return success
 
 
-def save_migration_plan(plan, filename: str):
+def save_migration_plan(plan, filename: str, zone_mapper=None):
     """Save migration plan to JSON file."""
     # Convert plan to serializable format
     plan_data = {
@@ -254,6 +305,10 @@ def save_migration_plan(plan, filename: str):
         'warnings': plan.warnings,
         'errors': plan.errors
     }
+    
+    # Add zone mapping data if available (v6)
+    if zone_mapper:
+        plan_data['interface_mapping'] = zone_mapper.get_report()
     
     with open(filename, 'w') as f:
         json.dump(plan_data, f, indent=2)
