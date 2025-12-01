@@ -957,69 +957,45 @@ class MigrationExecutor:
         
         return acp_id
     
-    def _resolve_zones_for_rule(self, source_members: List[str], dest_members: List[str]) -> Tuple[List[Dict], List[Dict], List[str]]:
+    def _resolve_zones_for_rule(
+        self, 
+        source_objects: List[Dict], 
+        dest_objects: List[Dict],
+        rule_name: str = ""
+    ) -> Tuple[Optional[Dict], Optional[Dict], List[str]]:
         """
-        Resolve source/destination zones from interface references in a rule.
+        Infer source/destination zones from the actual network addresses in the rule.
+        
+        This examines the IP addresses of source/destination objects:
+        - RFC1918/private addresses → INSIDE zone
+        - Public addresses → OUTSIDE zone
         
         Args:
-            source_members: Original source members from WatchGuard rule
-            dest_members: Original destination members from WatchGuard rule
+            source_objects: Resolved source network objects (with id, name, type)
+            dest_objects: Resolved destination network objects
+            rule_name: Name of rule for logging
             
         Returns:
-            Tuple of (source_zones, dest_zones, warnings)
+            Tuple of (source_zone_ref, dest_zone_ref, warnings)
         """
-        source_zones = []
-        dest_zones = []
-        warnings = []
-        
         if not self.zone_mapper:
-            return source_zones, dest_zones, warnings
+            return None, None, []
         
-        # Get source zones
-        src_zones, src_warnings = self.zone_mapper.get_zones_for_interfaces(source_members)
-        source_zones.extend(src_zones)
-        warnings.extend(src_warnings)
-        
-        # Get destination zones
-        dst_zones, dst_warnings = self.zone_mapper.get_zones_for_interfaces(dest_members)
-        dest_zones.extend(dst_zones)
-        warnings.extend(dst_warnings)
-        
-        return source_zones, dest_zones, warnings
+        return self.zone_mapper.infer_zones_from_networks(
+            source_objects, 
+            dest_objects,
+            self.fmc_discovery,
+            rule_name
+        )
     
     def _resolve_rule_objects(self, fmc_rule: Dict, policy_data: Dict) -> Tuple[Dict, List[Dict]]:
         """Resolve object names to IDs in a rule before sending to FMC.
         
-        Updated in v6 to add sourceZones and destinationZones.
+        Updated in v6.3 to infer zones from resolved network addresses.
         """
         resolved_rule = dict(fmc_rule)
         warnings = []
         rule_name = fmc_rule.get('name', 'unnamed_rule')
-        
-        # Get original members for zone mapping (v6)
-        source_members_original = policy_data.get('source_members_original', [])
-        dest_members_original = policy_data.get('dest_members_original', [])
-        
-        # Resolve zones (v6)
-        source_zones, dest_zones, zone_warnings = self._resolve_zones_for_rule(
-            source_members_original, dest_members_original
-        )
-        
-        if source_zones:
-            resolved_rule['sourceZones'] = {'objects': source_zones}
-            self.rules_with_zones += 1
-        
-        if dest_zones:
-            resolved_rule['destinationZones'] = {'objects': dest_zones}
-            if not source_zones:  # Only count once
-                self.rules_with_zones += 1
-        
-        for zw in zone_warnings:
-            warnings.append({
-                'type': 'zone_mapping',
-                'message': zw
-            })
-            self.rules_with_zone_warnings += 1
         
         # Resolve source networks
         if 'sourceNetworks' in resolved_rule:
@@ -1205,6 +1181,35 @@ class MigrationExecutor:
                 'application': app_name,
                 'app_action': app_action
             })
+        
+        # =====================================================================
+        # Zone inference based on resolved network addresses (v6.3)
+        # =====================================================================
+        if self.zone_mapper:
+            # Get the resolved source and destination objects
+            resolved_sources = resolved_rule.get('sourceNetworks', {}).get('objects', [])
+            resolved_dests = resolved_rule.get('destinationNetworks', {}).get('objects', [])
+            
+            # Infer zones from the actual network addresses
+            source_zone, dest_zone, zone_warnings = self._resolve_zones_for_rule(
+                resolved_sources, resolved_dests, rule_name
+            )
+            
+            if source_zone:
+                resolved_rule['sourceZones'] = {'objects': [source_zone]}
+                self.rules_with_zones += 1
+            
+            if dest_zone:
+                resolved_rule['destinationZones'] = {'objects': [dest_zone]}
+                if not source_zone:
+                    self.rules_with_zones += 1
+            
+            for zw in zone_warnings:
+                warnings.append({
+                    'type': 'zone_mapping',
+                    'message': zw
+                })
+                self.rules_with_zone_warnings += 1
         
         return resolved_rule, warnings
     
