@@ -173,7 +173,8 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False) -> bool:
         zone_mapper = ZoneMapper(fmc_client)
         
         # Discover FMC zones
-        zones_ok = zone_mapper.discover_fmc_zones()
+        zones_ok = zone_mapper.discover_fmc_zones() 
+        zone_mapper.load_wg_object_values(wg_config)
         if not zones_ok:
             print("  ⚠ Expected zones (INSIDE/OUTSIDE) not found - zone mapping may be incomplete")
         
