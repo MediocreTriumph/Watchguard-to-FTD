@@ -14,7 +14,9 @@ Zone Mapping Rules:
 This does NOT create interfaces or zones on the FTD - it only maps
 WatchGuard interfaces to existing FMC zones for rule creation.
 
-v6.1: Fixed interface alias zone mapping (Any-Trusted, Any-External, etc.)
+v6.2: Fixed zone mapping to actually apply zones to rules by:
+      - Pre-populating standard alias mappings in interface_to_zone dict
+      - Adding debug output for zone resolution
 """
 
 import ipaddress
@@ -141,7 +143,6 @@ class InterfaceClassifier:
         """Check if an IP address is private (RFC1918 or other internal ranges)."""
         try:
             addr = ipaddress.ip_address(ip_str)
-            # Use Python's built-in check
             return addr.is_private
         except ValueError:
             return False
@@ -305,11 +306,9 @@ class ZoneMapper:
             self.fmc_zones[item['name'].upper()] = obj
             self.report.fmc_zone_ids[item['name']] = item['id']
         
-        self.report.fmc_zones_found = [z for z in self.fmc_zones.keys() if z == z.upper() or z not in [z.upper() for z in self.fmc_zones.keys() if z != z.upper()]]
-        # Cleaner - just get unique zone names
+        # Get unique zone names for reporting
         unique_zones = set()
         for name in self.fmc_zones.keys():
-            # Prefer the original case
             if name not in [n.upper() for n in unique_zones]:
                 unique_zones.add(name)
         self.report.fmc_zones_found = list(unique_zones)
@@ -319,7 +318,6 @@ class ZoneMapper:
         # Check for expected zones
         missing = []
         for expected in self.EXPECTED_ZONES:
-            # Case-insensitive check
             if expected.upper() not in self.fmc_zones:
                 missing.append(expected)
         
@@ -329,7 +327,41 @@ class ZoneMapper:
             return False
         
         print(f"  ✓ Expected zones INSIDE and OUTSIDE are available")
+        
+        # Pre-populate standard alias mappings now that we have zone IDs
+        self._populate_standard_alias_mappings()
+        
         return True
+    
+    def _populate_standard_alias_mappings(self):
+        """
+        Pre-populate interface_to_zone with standard alias mappings.
+        This ensures aliases like Any-Trusted can be looked up directly.
+        """
+        print("  Populating standard interface alias zone mappings...")
+        
+        for alias_name, zone_name in self.INTERFACE_ALIAS_ZONE_MAP.items():
+            zone_obj = self.fmc_zones.get(zone_name.upper())
+            if zone_obj:
+                result = InterfaceMappingResult(
+                    wg_interface=alias_name,
+                    ip=None,
+                    zone=zone_name,
+                    zone_id=zone_obj.id,
+                    reason=f"Standard alias mapping ({alias_name} → {zone_name})"
+                )
+                self.interface_to_zone[alias_name] = result
+                
+                # Also add to report's mapped list
+                self.report.mapped.append({
+                    "wg_interface": alias_name,
+                    "device": "",
+                    "ip": "",
+                    "zone": zone_name,
+                    "reason": f"Standard alias mapping"
+                })
+                
+                print(f"    {alias_name} → {zone_name}")
     
     def parse_wg_interfaces(self, wg_config_data: Dict[str, Any]) -> int:
         """
@@ -372,12 +404,6 @@ class ZoneMapper:
     def parse_interface_aliases(self, wg_config_data: Dict[str, Any]):
         """
         Identify address groups that are interface aliases.
-        
-        These are groups whose members are interface names, not network objects.
-        They need special handling during group creation and rule mapping.
-        
-        Args:
-            wg_config_data: Raw WatchGuard config dict
         """
         interface_aliases = wg_config_data.get("interface_aliases", [])
         
@@ -389,7 +415,6 @@ class ZoneMapper:
         
         for alias in interface_aliases:
             name = alias.get("name", "")
-            # member_interfaces contains the actual interface references
             members = alias.get("member_interfaces", [])
             
             if name and members:
@@ -415,11 +440,14 @@ class ZoneMapper:
         unmapped_count = 0
         
         for name, iface in self.wg_interfaces.items():
-            # Determine target zone
+            # Skip if already mapped (e.g., standard aliases)
+            if name in self.interface_to_zone:
+                mapped_count += 1
+                continue
+            
             target_zone = iface.zone_classification
             
             if target_zone:
-                # Case-insensitive zone lookup
                 zone_obj = self.fmc_zones.get(target_zone.upper())
                 if zone_obj:
                     result = InterfaceMappingResult(
@@ -466,14 +494,7 @@ class ZoneMapper:
     def _get_zone_ref(self, zone_name: str) -> Optional[Dict[str, str]]:
         """
         Get FMC zone reference dict by zone name.
-        
-        Args:
-            zone_name: Zone name (e.g., "INSIDE", "OUTSIDE")
-            
-        Returns:
-            Zone reference dict or None
         """
-        # Case-insensitive lookup
         zone_obj = self.fmc_zones.get(zone_name.upper())
         if zone_obj:
             return {
@@ -486,20 +507,8 @@ class ZoneMapper:
     def get_zone_for_interface(self, interface_name: str) -> Optional[Dict[str, str]]:
         """
         Get the FMC zone reference for a WatchGuard interface.
-        
-        Args:
-            interface_name: WatchGuard interface name
-            
-        Returns:
-            Dict with zone reference for FMC API, or None if not mapped
-            Example: {"name": "INSIDE", "id": "uuid...", "type": "SecurityZone"}
         """
-        # Check standard interface alias mappings first
-        if interface_name in self.INTERFACE_ALIAS_ZONE_MAP:
-            zone_name = self.INTERFACE_ALIAS_ZONE_MAP[interface_name]
-            return self._get_zone_ref(zone_name)
-        
-        # Check actual interface mappings
+        # First check the interface_to_zone mapping (includes standard aliases now)
         result = self.interface_to_zone.get(interface_name)
         if result and result.is_mapped:
             return {
@@ -508,78 +517,45 @@ class ZoneMapper:
                 "type": "SecurityZone"
             }
         
+        # Fallback: check INTERFACE_ALIAS_ZONE_MAP directly
+        if interface_name in self.INTERFACE_ALIAS_ZONE_MAP:
+            zone_name = self.INTERFACE_ALIAS_ZONE_MAP[interface_name]
+            return self._get_zone_ref(zone_name)
+        
         return None
     
     def is_interface_reference(self, name: str) -> bool:
         """
         Check if a name refers to an interface (vs a network object).
-        
-        Args:
-            name: Object/interface name from WatchGuard config
-            
-        Returns:
-            True if this is an interface name
         """
-        # Direct interface match
         if name in self.wg_interfaces:
             return True
-        
-        # Interface alias match
         if name in self.interface_aliases:
             return True
-        
-        # Check standard interface aliases
         if name in self.INTERFACE_ALIAS_ZONE_MAP:
             return True
-        
-        # Check skip aliases (also interface references, just no zone)
         if name in self.SKIP_ZONE_ALIASES:
             return True
-        
-        # Check common interface alias patterns
-        interface_patterns = [
-            "Any-BOVPN", "Any-MUVPN"
-        ]
-        if name in interface_patterns:
+        if name in ["Any-BOVPN", "Any-MUVPN"]:
             return True
-        
         return False
     
     def get_zones_for_interfaces(self, interface_names: List[str]) -> Tuple[List[Dict], List[str]]:
         """
         Get FMC zone references for a list of WatchGuard interface names.
         
-        This handles both:
-        - Standard interface aliases (Any-Trusted, Any-External, etc.)
-        - Actual interface names with IP-based zone classification
-        
-        Args:
-            interface_names: List of interface names from a rule
-            
-        Returns:
-            Tuple of (zone_objects, warnings)
-            - zone_objects: List of FMC zone references
-            - warnings: List of warning messages for unmapped interfaces
+        This is the main method called by the executor to get zones for rules.
         """
         zones = []
         warnings = []
-        seen_zones = set()  # Avoid duplicates
+        seen_zones = set()
         
         for name in interface_names:
-            # Skip aliases that mean "any zone" or are special
+            # Skip aliases that mean "any zone"
             if name in self.SKIP_ZONE_ALIASES:
                 continue
             
-            # Check standard interface alias mappings
-            if name in self.INTERFACE_ALIAS_ZONE_MAP:
-                zone_name = self.INTERFACE_ALIAS_ZONE_MAP[name]
-                zone_ref = self._get_zone_ref(zone_name)
-                if zone_ref and zone_ref["id"] not in seen_zones:
-                    zones.append(zone_ref)
-                    seen_zones.add(zone_ref["id"])
-                continue
-            
-            # Get zone from interface mapping
+            # Try to get zone for this interface/alias
             zone_ref = self.get_zone_for_interface(name)
             
             if zone_ref:
@@ -590,7 +566,6 @@ class ZoneMapper:
             else:
                 # Check if it's an interface alias we should resolve
                 if name in self.interface_aliases:
-                    # Get zones for the interfaces in this alias
                     alias_interfaces = self.interface_aliases[name]
                     for iface in alias_interfaces:
                         iface_zone_ref = self.get_zone_for_interface(iface)
@@ -605,7 +580,7 @@ class ZoneMapper:
                             )
                 elif self.is_interface_reference(name):
                     warnings.append(f"Interface '{name}' has no zone mapping")
-                # If not an interface reference, it's probably a network object - ignore
+                # If not an interface reference, it's a network object - no warning
         
         return zones, warnings
     
@@ -619,7 +594,6 @@ class ZoneMapper:
         print("INTERFACE TO ZONE MAPPING SUMMARY")
         print("=" * 60)
         
-        # Get unique zone names
         unique_zones = set()
         for name in self.fmc_zones.keys():
             if name != name.upper():
@@ -635,20 +609,22 @@ class ZoneMapper:
             print(f"\n⚠ Missing expected zones: {', '.join(self.report.missing_zones)}")
         
         print(f"\nWatchGuard Interfaces: {len(self.wg_interfaces)}")
-        print(f"  Mapped to zones: {len(self.report.mapped)}")
+        print(f"  Mapped to zones: {len([m for m in self.report.mapped])}")
         print(f"  Unmapped: {len(self.report.unmapped)}")
+        
+        print(f"\nInterface-to-Zone Mappings: {len(self.interface_to_zone)}")
         
         if self.interface_aliases:
             print(f"\nInterface Aliases: {len(self.interface_aliases)}")
         
-        # Standard alias mappings
         print(f"\nStandard Alias Zone Mappings:")
         for alias, zone in self.INTERFACE_ALIAS_ZONE_MAP.items():
-            print(f"  {alias} → {zone}")
+            status = "✓" if alias in self.interface_to_zone else "?"
+            print(f"  {status} {alias} → {zone}")
         
         if self.report.unmapped:
             print("\nUnmapped Interfaces (require manual review):")
-            for entry in self.report.unmapped[:10]:  # Show first 10
+            for entry in self.report.unmapped[:10]:
                 print(f"  - {entry['wg_interface']}: {entry['reason']}")
             if len(self.report.unmapped) > 10:
                 print(f"  ... and {len(self.report.unmapped) - 10} more")
