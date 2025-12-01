@@ -163,34 +163,26 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False) -> bool:
     discovery = FMCDiscovery(fmc_client)
     fmc_objects = discovery.discover_all()
     
-    # Step 3.5: Zone Mapping (v6) - if enabled
+    # Step 3.5: Zone Mapping (v6.3) - if enabled
     zone_mapper = None
     if enable_zones:
         print("\n" + "="*60)
-        print("STEP 3.5: INTERFACE AND ZONE MAPPING")
+        print("STEP 3.5: ZONE MAPPING")
         print("="*60)
         
         zone_mapper = ZoneMapper(fmc_client)
         
         # Discover FMC zones
-        zones_ok = zone_mapper.discover_fmc_zones() 
-        zone_mapper.load_wg_object_values(wg_config)
+        zones_ok = zone_mapper.discover_fmc_zones()
         if not zones_ok:
-            print("  ⚠ Expected zones (INSIDE/OUTSIDE) not found - zone mapping may be incomplete")
-        
-        # Parse WatchGuard interfaces
-        if interfaces_count > 0:
-            zone_mapper.parse_wg_interfaces(wg_data)
-            zone_mapper.build_zone_mappings()
+            print("  ⚠ Expected zones (INSIDE/OUTSIDE) not found - zone mapping disabled")
+            zone_mapper = None
         else:
-            print("  ⚠ No interfaces found in WatchGuard config - zone mapping skipped")
-        
-        # Parse interface aliases
-        if interface_aliases_count > 0:
-            zone_mapper.parse_interface_aliases(wg_data)
-        
-        # Print summary
-        zone_mapper.print_summary()
+            # Load WatchGuard object values for zone inference
+            zone_mapper.load_wg_object_values(wg_config)
+            
+            # Print summary
+            zone_mapper.print_summary()
     
     # Step 4: Build canonical port mappings
     print("\n" + "="*60)
