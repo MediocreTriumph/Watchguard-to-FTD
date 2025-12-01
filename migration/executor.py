@@ -73,8 +73,8 @@ class MigrationExecutor:
             if hasattr(self.fmc_discovery, 'url_objects'):
                 for name, obj in self.fmc_discovery.url_objects.items():
                     self.all_objects[name] = obj
-            if hasattr(self.fmc_discovery, 'port_object_groups'):
-                for name, obj in self.fmc_discovery.port_object_groups.items():
+            if hasattr(self.fmc_discovery, 'port_groups'):
+                for name, obj in self.fmc_discovery.port_groups.items():
                     self.all_objects[name] = obj
                     # Also register with _svc_group suffix for planner compatibility
                     svc_group_name = f"{name}_svc_group"
