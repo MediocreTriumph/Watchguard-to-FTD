@@ -166,6 +166,45 @@ class FMCClient:
                 'status_code': response.status_code
             }
     
+    def get_access_policies(self) -> List[Dict]:
+        """Get all Access Control Policies."""
+        endpoint = f"{self.base_url}/domain/{self.domain_uuid}/policy/accesspolicies"
+        return self.get_paginated(endpoint)
+    
+    def get_access_policy(self, name_or_uuid: str) -> Optional[Dict]:
+        """
+        Get an Access Control Policy by name or UUID.
+        
+        Args:
+            name_or_uuid: Either the policy name or UUID
+            
+        Returns:
+            Policy dict with 'id' and 'name' keys, or None if not found
+        """
+        # Check if it looks like a UUID (contains dashes and hex chars)
+        is_uuid = '-' in name_or_uuid and len(name_or_uuid) == 36
+        
+        if is_uuid:
+            # Try direct lookup by UUID
+            endpoint = f"{self.base_url}/domain/{self.domain_uuid}/policy/accesspolicies/{name_or_uuid}"
+            response = self._make_request('GET', endpoint)
+            
+            if response.status_code == 200:
+                return response.json()
+            # If UUID lookup fails, fall through to name search
+        
+        # Search by name
+        policies = self.get_access_policies()
+        
+        for policy in policies:
+            if policy.get('name') == name_or_uuid:
+                return policy
+            # Also check UUID in case the user provided it but it didn't match the format check
+            if policy.get('id') == name_or_uuid:
+                return policy
+        
+        return None
+    
     def create_access_policy(self, name: str, default_action: str = "BLOCK") -> Dict:
         """Create a new Access Control Policy."""
         endpoint = f"{self.base_url}/domain/{self.domain_uuid}/policy/accesspolicies"
