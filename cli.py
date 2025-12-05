@@ -3,7 +3,7 @@
 WatchGuard to Cisco FTD Migration Tool - CLI Entry Point
 
 Updated for v6 with interface discovery and zone mapping.
-Updated for v7 with existing ACP support.
+Updated for v7 with existing ACP support and user mapping.
 """
 
 import sys
@@ -17,6 +17,7 @@ from fmc.client import FMCClient
 from fmc.discovery import FMCDiscovery
 from fmc.canonical import CanonicalPortMapper
 from fmc.zones import ZoneMapper
+from fmc.user_mapper import UserMapper
 from analysis.service_mapper import ServiceMapper
 from analysis.app_mapper import ApplicationMapper
 from migration.planner import MigrationPlanner
@@ -47,6 +48,11 @@ Examples:
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
       --fmc-user admin --fmc-pass password --execute \\
       --new-acp "Migrated-WG-Policy" --enable-zones
+      
+  # Execute with user mapping (requires identity policy/realm configured)
+  python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
+      --fmc-user admin --fmc-pass password --execute \\
+      --existing-acp "My-Existing-Policy" --enable-users
         '''
     )
     
@@ -75,6 +81,12 @@ Examples:
     parser.add_argument('--enable-zones', action='store_true',
                        help='Enable interface-to-zone mapping (requires INSIDE/OUTSIDE zones in FMC)')
     
+    # User mapping options (v7)
+    parser.add_argument('--enable-users', action='store_true',
+                       help='Enable user mapping from WatchGuard aliases to FMC realm users')
+    parser.add_argument('--user-confidence', type=float, default=0.85,
+                       help='User matching confidence threshold (default: 0.85)')
+    
     # Matching options
     parser.add_argument('--app-confidence', type=float, default=0.85,
                        help='Application matching confidence threshold (default: 0.85)')
@@ -99,8 +111,13 @@ Examples:
     
     # Run migration
     try:
-        success = run_migration(config, enable_zones=args.enable_zones, 
-                               use_existing_acp=use_existing_acp)
+        success = run_migration(
+            config, 
+            enable_zones=args.enable_zones, 
+            use_existing_acp=use_existing_acp,
+            enable_users=args.enable_users,
+            user_confidence=args.user_confidence
+        )
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Migration failed: {e}")
@@ -110,7 +127,8 @@ Examples:
 
 
 def run_migration(config: MigrationConfig, enable_zones: bool = False,
-                  use_existing_acp: bool = False) -> bool:
+                  use_existing_acp: bool = False, enable_users: bool = False,
+                  user_confidence: float = 0.85) -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -125,6 +143,8 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
         print(f"New ACP: {config.new_acp_name}")
     if enable_zones:
         print(f"Zone Mapping: ENABLED")
+    if enable_users:
+        print(f"User Mapping: ENABLED")
     
     # Step 1: Load WatchGuard configuration
     print("\n" + "="*60)
@@ -153,6 +173,14 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
         print(f"  Interfaces:     {interfaces_count}")
     if interface_aliases_count > 0:
         print(f"  Interface Aliases: {interface_aliases_count}")
+    
+    # Count users in address groups
+    all_users = set()
+    for group in wg_config.address_groups:
+        if group.member_users:
+            all_users.update(group.member_users)
+    if all_users:
+        print(f"  Users in groups: {len(all_users)}")
     
     # Step 2: Connect to FMC
     print("\n" + "="*60)
@@ -202,6 +230,27 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
             # Print summary
             zone_mapper.print_summary()
     
+    # Step 3.6: User Mapping (v7) - if enabled
+    user_mapper = None
+    if enable_users and all_users:
+        print("\n" + "="*60)
+        print("STEP 3.6: USER MAPPING")
+        print("="*60)
+        
+        user_mapper = UserMapper(fmc_client, confidence_threshold=user_confidence)
+        
+        # Discover realms and users
+        realms_ok = user_mapper.discover_realms()
+        if not realms_ok:
+            print("  ⚠ No identity realms found - user mapping disabled")
+            user_mapper = None
+        else:
+            # Map WatchGuard users to FMC realm users
+            user_mapper.map_users(list(all_users))
+            user_mapper.print_summary()
+    elif enable_users and not all_users:
+        print("\n  ℹ User mapping enabled but no users found in WatchGuard config")
+    
     # Step 4: Build canonical port mappings
     print("\n" + "="*60)
     print("STEP 4: BUILDING CANONICAL MAPPINGS")
@@ -248,7 +297,8 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("STEP 7: BUILDING MIGRATION PLAN")
     print("="*60)
     
-    planner = MigrationPlanner(wg_config, fmc_objects, service_mapper, app_mapper)
+    planner = MigrationPlanner(wg_config, fmc_objects, service_mapper, app_mapper,
+                               user_mapper=user_mapper)
     plan = planner.build_plan()
     
     # Step 8: Save plan to file
@@ -257,13 +307,18 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("="*60)
     
     plan_file = "migration_plan.json"
-    save_migration_plan(plan, plan_file, zone_mapper)
+    save_migration_plan(plan, plan_file, zone_mapper, user_mapper)
     print(f"\n✓ Migration plan saved to: {plan_file}")
     
     # Show application mapping summary
     policies_with_apps = plan.statistics.get('policies_with_applications', 0)
     if policies_with_apps > 0:
         print(f"  Policies with applications: {policies_with_apps}")
+    
+    # Show user mapping summary
+    policies_with_users = plan.statistics.get('policies_with_users', 0)
+    if policies_with_users > 0:
+        print(f"  Policies with users: {policies_with_users}")
     
     if config.dry_run:
         print("\n" + "="*60)
@@ -279,15 +334,15 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("="*60)
     print("\n⚠  This will create objects in FMC")
     
-    # Pass fmc_objects and zone_mapper to executor
+    # Pass fmc_objects, zone_mapper, and user_mapper to executor
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
-                                  zone_mapper=zone_mapper)
+                                  zone_mapper=zone_mapper, user_mapper=user_mapper)
     success = executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
     
     return success
 
 
-def save_migration_plan(plan, filename: str, zone_mapper=None):
+def save_migration_plan(plan, filename: str, zone_mapper=None, user_mapper=None):
     """Save migration plan to JSON file."""
     # Convert plan to serializable format
     plan_data = {
@@ -296,7 +351,8 @@ def save_migration_plan(plan, filename: str, zone_mapper=None):
             'mapped_to_existing': plan.mapped_to_existing,
             'needs_creation': plan.needs_creation,
             'unmapped': plan.unmapped,
-            'policies_with_applications': plan.statistics.get('policies_with_applications', 0)
+            'policies_with_applications': plan.statistics.get('policies_with_applications', 0),
+            'policies_with_users': plan.statistics.get('policies_with_users', 0)
         },
         'address_mappings': {
             name: {'id': obj.id, 'name': obj.name, 'type': obj.type}
@@ -319,7 +375,11 @@ def save_migration_plan(plan, filename: str, zone_mapper=None):
     
     # Add zone mapping data if available (v6)
     if zone_mapper:
-        plan_data['interface_mapping'] = zone_mapper.get_report()
+        plan_data['zone_mapping'] = zone_mapper.get_report()
+    
+    # Add user mapping data if available (v7)
+    if user_mapper:
+        plan_data['user_mapping'] = user_mapper.get_report()
     
     with open(filename, 'w') as f:
         json.dump(plan_data, f, indent=2)
