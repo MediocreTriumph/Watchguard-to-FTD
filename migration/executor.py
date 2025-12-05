@@ -4,6 +4,7 @@ Enhanced with unified reporting via MigrationReporter.
 
 Updated for v5 parser with service group support.
 Updated for v6 with interface discovery and zone mapping.
+Updated for v7 with existing ACP support.
 """
 
 import time
@@ -245,8 +246,13 @@ class MigrationExecutor:
         
         return fmc_obj
     
-    def execute(self, acp_name: str) -> bool:
-        """Execute the migration plan."""
+    def execute(self, acp_name: str, use_existing_acp: bool = False) -> bool:
+        """Execute the migration plan.
+        
+        Args:
+            acp_name: Name of the ACP (to create or use existing)
+            use_existing_acp: If True, look up existing ACP instead of creating new
+        """
         print("\n" + "="*60)
         print("EXECUTING MIGRATION")
         print("="*60)
@@ -273,7 +279,12 @@ class MigrationExecutor:
         if not self._create_network_groups():
             success = False
         
-        acp_id = self._create_access_policy(acp_name)
+        # Get or create ACP (v7)
+        if use_existing_acp:
+            acp_id = self._get_existing_access_policy(acp_name)
+        else:
+            acp_id = self._create_access_policy(acp_name)
+        
         if not acp_id:
             success = False
             self._save_reports()
@@ -938,6 +949,38 @@ class MigrationExecutor:
             'objects': objects,
             'description': wg_group.description[:200] if wg_group.description else ''
         }, skipped_interfaces
+    
+    def _get_existing_access_policy(self, acp_name: str) -> Optional[str]:
+        """Look up an existing Access Control Policy by name or UUID.
+        
+        Args:
+            acp_name: Name or UUID of the existing ACP
+            
+        Returns:
+            ACP ID if found, None otherwise
+        """
+        print("\n" + "-"*60)
+        print(f"Looking up existing Access Control Policy: {acp_name}")
+        print("-"*60)
+        
+        policy = self.fmc.get_access_policy(acp_name)
+        
+        if not policy:
+            self.errors.append(f"Access Control Policy not found: {acp_name}")
+            print(f"✗ ACP not found: {acp_name}")
+            print("\nAvailable ACPs:")
+            policies = self.fmc.get_access_policies()
+            for p in policies[:10]:  # Show first 10
+                print(f"  - {p.get('name')} (ID: {p.get('id')})")
+            if len(policies) > 10:
+                print(f"  ... and {len(policies) - 10} more")
+            return None
+        
+        acp_id = policy['id']
+        acp_actual_name = policy.get('name', acp_name)
+        print(f"✓ Found ACP: {acp_actual_name} (ID: {acp_id})")
+        
+        return acp_id
     
     def _create_access_policy(self, acp_name: str) -> Optional[str]:
         """Create Access Control Policy."""
