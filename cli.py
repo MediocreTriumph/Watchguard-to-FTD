@@ -3,6 +3,7 @@
 WatchGuard to Cisco FTD Migration Tool - CLI Entry Point
 
 Updated for v6 with interface discovery and zone mapping.
+Updated for v7 with existing ACP support.
 """
 
 import sys
@@ -32,10 +33,15 @@ Examples:
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
       --fmc-user admin --fmc-pass password --dry-run
 
-  # Execute migration
+  # Execute migration to a NEW Access Control Policy
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
       --fmc-user admin --fmc-pass password --execute \\
       --new-acp "Migrated-WG-Policy"
+      
+  # Execute migration to an EXISTING Access Control Policy
+  python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
+      --fmc-user admin --fmc-pass password --execute \\
+      --existing-acp "My-Existing-Policy"
       
   # Execute with zone mapping (assumes INSIDE/OUTSIDE zones exist)
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
@@ -54,9 +60,12 @@ Examples:
     parser.add_argument('--no-verify-ssl', action='store_true', 
                        help='Disable SSL verification (for self-signed certs)')
     
-    # Migration options
-    parser.add_argument('--new-acp', default='Migrated-WG-Policy',
-                       help='Name for new Access Control Policy (default: Migrated-WG-Policy)')
+    # Migration options - mutually exclusive ACP options
+    acp_group = parser.add_mutually_exclusive_group()
+    acp_group.add_argument('--new-acp', default=None,
+                       help='Name for new Access Control Policy to create')
+    acp_group.add_argument('--existing-acp',
+                       help='Name or UUID of existing Access Control Policy to add rules to')
     parser.add_argument('--execute', action='store_true',
                        help='Execute migration (default is dry-run)')
     parser.add_argument('--dry-run', action='store_true', default=True,
@@ -72,6 +81,10 @@ Examples:
     
     args = parser.parse_args()
     
+    # Determine ACP name - default to creating new if neither specified
+    acp_name = args.new_acp or args.existing_acp or 'Migrated-WG-Policy'
+    use_existing_acp = args.existing_acp is not None
+    
     # Build configuration
     config = MigrationConfig(
         watchguard_config_file=args.config_file,
@@ -79,14 +92,15 @@ Examples:
         fmc_username=args.fmc_user,
         fmc_password=args.fmc_pass,
         verify_ssl=not args.no_verify_ssl,
-        new_acp_name=args.new_acp,
+        new_acp_name=acp_name,
         dry_run=not args.execute,
         app_match_confidence_threshold=args.app_confidence
     )
     
     # Run migration
     try:
-        success = run_migration(config, enable_zones=args.enable_zones)
+        success = run_migration(config, enable_zones=args.enable_zones, 
+                               use_existing_acp=use_existing_acp)
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Migration failed: {e}")
@@ -95,7 +109,8 @@ Examples:
         sys.exit(1)
 
 
-def run_migration(config: MigrationConfig, enable_zones: bool = False) -> bool:
+def run_migration(config: MigrationConfig, enable_zones: bool = False,
+                  use_existing_acp: bool = False) -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -104,7 +119,10 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False) -> bool:
     print(f"\nMode: {'DRY RUN' if config.dry_run else 'EXECUTE'}")
     print(f"Source: {config.watchguard_config_file}")
     print(f"Target: {config.fmc_host}")
-    print(f"New ACP: {config.new_acp_name}")
+    if use_existing_acp:
+        print(f"Existing ACP: {config.new_acp_name}")
+    else:
+        print(f"New ACP: {config.new_acp_name}")
     if enable_zones:
         print(f"Zone Mapping: ENABLED")
     
@@ -264,7 +282,7 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False) -> bool:
     # Pass fmc_objects and zone_mapper to executor
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
                                   zone_mapper=zone_mapper)
-    success = executor.execute(config.new_acp_name)
+    success = executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
     
     return success
 
