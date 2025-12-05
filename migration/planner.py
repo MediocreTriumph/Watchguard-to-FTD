@@ -2,6 +2,7 @@
 Migration Planner - Creates migration plan with proper alias resolution.
 
 Updated for v5 parser with service group support.
+Updated for v7 with user mapping support.
 """
 
 from typing import Dict, List, Set, Any, Optional, Tuple
@@ -87,11 +88,12 @@ class MigrationPlanner:
     """Plans migration from WatchGuard to FMC with proper alias resolution."""
     
     def __init__(self, wg_config: WatchGuardConfig, fmc_discovery, 
-                 service_mapper, app_mapper):
+                 service_mapper, app_mapper, user_mapper=None):
         self.wg_config = wg_config
         self.fmc_discovery = fmc_discovery
         self.service_mapper = service_mapper
         self.app_mapper = app_mapper
+        self.user_mapper = user_mapper  # v7: optional user mapper
         self._build_lookups()
     
     def _is_host_mask(self, mask: str) -> bool:
@@ -258,6 +260,43 @@ class MigrationPlanner:
         
         return list(set(resolved))
     
+    def resolve_alias_to_users(self, alias_name: str, visited: Optional[Set[str]] = None) -> List[str]:
+        """
+        Recursively resolve alias to user names.
+        
+        Args:
+            alias_name: Name of the alias/group to resolve
+            visited: Set of already-visited aliases (for cycle detection)
+            
+        Returns:
+            List of WatchGuard user strings (e.g., "DOMAIN\\username")
+        """
+        if visited is None:
+            visited = set()
+        
+        if alias_name in visited:
+            return []
+        visited.add(alias_name)
+        
+        if alias_name in ["Any", "Any-External", "Any-Trusted", "Any-Optional"]:
+            return []
+        
+        if alias_name not in self.address_groups:
+            return []
+        
+        group = self.address_groups[alias_name]
+        resolved = []
+        
+        # Get direct user members
+        if group.member_users:
+            resolved.extend(group.member_users)
+        
+        # Recursively resolve alias references
+        for alias_ref in group.alias_references:
+            resolved.extend(self.resolve_alias_to_users(alias_ref, visited))
+        
+        return list(set(resolved))
+    
     def resolve_service(self, service_name: str) -> Dict[str, Any]:
         """
         Resolve a WatchGuard service name to either a service group or individual service.
@@ -358,6 +397,7 @@ class MigrationPlanner:
         policies_with_warnings = 0
         policies_with_apps = 0
         policies_with_service_groups = 0
+        policies_with_users = 0
         
         for policy in self.wg_config.policies:
             policy_plan, issues = self._plan_policy(policy, address_mappings, 
@@ -370,12 +410,16 @@ class MigrationPlanner:
                 policies_with_apps += 1
             if policy_plan.get('uses_service_group'):
                 policies_with_service_groups += 1
+            if policy_plan.get('users_resolved'):
+                policies_with_users += 1
             policies_to_create.append(policy_plan)
         
         print(f"  Total policies: {len(self.wg_config.policies)}")
         print(f"  With issues: {policies_with_issues}")
         print(f"  With applications: {policies_with_apps}")
         print(f"  With service groups: {policies_with_service_groups}")
+        if policies_with_users > 0:
+            print(f"  With users: {policies_with_users}")
         
         statistics = {
             'total_wg_objects': len(self.address_objects),
@@ -388,6 +432,7 @@ class MigrationPlanner:
             'policies_with_errors': policies_with_issues,
             'policies_with_applications': policies_with_apps,
             'policies_with_service_groups': policies_with_service_groups,
+            'policies_with_users': policies_with_users,
             'service_groups_to_create': len(service_groups_to_create)
         }
         
@@ -403,7 +448,7 @@ class MigrationPlanner:
     
     def _plan_policy(self, policy: WatchGuardPolicy, address_mappings: Dict,
                      service_mappings: Dict, application_mappings: Dict) -> Tuple[Dict, List]:
-        """Plan policy with alias resolution and service group support."""
+        """Plan policy with alias resolution, service group support, and user mapping."""
         issues = []
         warnings = []
         
@@ -434,6 +479,34 @@ class MigrationPlanner:
                         'type': fmc_type,
                         'name': name
                     })
+        
+        # =====================================================================
+        # Resolve users from source aliases (v7)
+        # =====================================================================
+        user_objects = []
+        unmapped_users = []
+        users_resolved = []  # Track WatchGuard users for this policy
+        
+        if self.user_mapper:
+            # Collect users from source aliases
+            for member in policy.source_members:
+                resolved_users = self.resolve_alias_to_users(member)
+                users_resolved.extend(resolved_users)
+            
+            # Deduplicate
+            users_resolved = list(set(users_resolved))
+            
+            # Map WatchGuard users to FMC realm users
+            for wg_user in users_resolved:
+                fmc_user_ref = self.user_mapper.get_fmc_user_ref(wg_user)
+                if fmc_user_ref:
+                    user_objects.append(fmc_user_ref)
+                else:
+                    unmapped_users.append(wg_user)
+            
+            # Log warnings for unmapped users
+            for unmapped in unmapped_users:
+                warnings.append(f"User '{unmapped}' has no FMC realm user mapping")
         
         # =====================================================================
         # Resolve services (updated for v5 with service groups)
@@ -667,6 +740,10 @@ class MigrationPlanner:
         if dest_objects:
             fmc_rule['destinationNetworks'] = {'objects': dest_objects}
         
+        # Add users if any were resolved (v7)
+        if user_objects:
+            fmc_rule['users'] = {'objects': user_objects}
+        
         # Add port objects (TCP/UDP and port groups)
         if service_objects:
             valid_services = [s for s in service_objects if 'id' in s and not s.get('needs_creation')]
@@ -715,7 +792,11 @@ class MigrationPlanner:
             'uses_service_group': uses_service_group,
             'service_group_name': service_group_name,
             'icmp_objects': icmp_objects,
-            'protocol_objects': protocol_objects
+            'protocol_objects': protocol_objects,
+            # v7: user tracking
+            'users_resolved': users_resolved,
+            'users_mapped': len(user_objects),
+            'users_unmapped': unmapped_users
         }, issues
     
     def _map_action(self, wg_action: str) -> str:

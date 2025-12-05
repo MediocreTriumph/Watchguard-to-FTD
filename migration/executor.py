@@ -4,7 +4,7 @@ Enhanced with unified reporting via MigrationReporter.
 
 Updated for v5 parser with service group support.
 Updated for v6 with interface discovery and zone mapping.
-Updated for v7 with existing ACP support.
+Updated for v7 with existing ACP support and user mapping.
 """
 
 import time
@@ -28,11 +28,12 @@ class MigrationExecutor:
     """Executes migration plan by creating objects in FMC."""
     
     def __init__(self, fmc_client: FMCClient, plan, fmc_discovery=None, 
-                 zone_mapper=None):
+                 zone_mapper=None, user_mapper=None):
         self.fmc = fmc_client
         self.plan = plan
         self.fmc_discovery = fmc_discovery
         self.zone_mapper = zone_mapper
+        self.user_mapper = user_mapper  # v7: optional user mapper
         self.created_objects: Dict[str, FMCObject] = {}
         self.execution_log: List[str] = []
         self.errors: List[str] = []
@@ -48,6 +49,10 @@ class MigrationExecutor:
         # Zone mapping statistics (v6)
         self.rules_with_zones: int = 0
         self.rules_with_zone_warnings: int = 0
+        
+        # User mapping statistics (v7)
+        self.rules_with_users: int = 0
+        self.total_users_applied: int = 0
         
         # Unified reporter
         self.reporter = MigrationReporter()
@@ -298,12 +303,16 @@ class MigrationExecutor:
         return success
     
     def _save_reports(self):
-        """Save migration report, including zone mapping info if available."""
+        """Save migration report, including zone and user mapping info if available."""
         # Add zone mapping report if available
         if self.zone_mapper:
             zone_report = self.zone_mapper.get_report()
-            # Reporter will include this in the final report
             self.reporter.zone_mapping_report = zone_report
+        
+        # Add user mapping report if available (v7)
+        if self.user_mapper:
+            user_report = self.user_mapper.get_report()
+            self.reporter.user_mapping_report = user_report
         
         self.reporter.save_report()
     
@@ -1008,18 +1017,6 @@ class MigrationExecutor:
     ) -> Tuple[Optional[Dict], Optional[Dict], List[str]]:
         """
         Infer source/destination zones from the actual network addresses in the rule.
-        
-        This examines the IP addresses of source/destination objects:
-        - RFC1918/private addresses → INSIDE zone
-        - Public addresses → OUTSIDE zone
-        
-        Args:
-            source_objects: Resolved source network objects (with id, name, type)
-            dest_objects: Resolved destination network objects
-            rule_name: Name of rule for logging
-            
-        Returns:
-            Tuple of (source_zone_ref, dest_zone_ref, warnings)
         """
         if not self.zone_mapper:
             return None, None, []
@@ -1032,10 +1029,7 @@ class MigrationExecutor:
         )
     
     def _resolve_rule_objects(self, fmc_rule: Dict, policy_data: Dict) -> Tuple[Dict, List[Dict]]:
-        """Resolve object names to IDs in a rule before sending to FMC.
-        
-        Updated in v6.3 to infer zones from resolved network addresses.
-        """
+        """Resolve object names to IDs in a rule before sending to FMC."""
         resolved_rule = dict(fmc_rule)
         warnings = []
         rule_name = fmc_rule.get('name', 'unnamed_rule')
@@ -1048,7 +1042,6 @@ class MigrationExecutor:
             for obj_ref in resolved_rule['sourceNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
-                    # Skip interface references (v6)
                     if self._is_interface_reference(obj_name):
                         continue
                     
@@ -1097,7 +1090,6 @@ class MigrationExecutor:
             for obj_ref in resolved_rule['destinationNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
-                    # Skip interface references (v6)
                     if self._is_interface_reference(obj_name):
                         continue
                     
@@ -1139,18 +1131,15 @@ class MigrationExecutor:
             if resolved_dest_urls:
                 resolved_rule['urls'] = {'objects': resolved_dest_urls}
         
-        # Resolve services (updated for v5 with service groups, ICMP, protocol-only)
+        # Resolve services
         if 'destinationPorts' in resolved_rule:
             resolved_ports = []
             resolved_literals = []
             
-            # Handle objects (TCP/UDP port objects and port groups)
             for obj_ref in resolved_rule['destinationPorts'].get('objects', []):
                 if 'id' in obj_ref and not obj_ref.get('needs_creation'):
-                    # Already resolved
                     resolved_ports.append(obj_ref)
                 elif obj_ref.get('is_service_group'):
-                    # Service group - look it up
                     group_name = obj_ref.get('name')
                     fmc_obj = self._lookup_object(group_name)
                     if fmc_obj:
@@ -1167,7 +1156,6 @@ class MigrationExecutor:
                             'reason': 'Service group not found in FMC'
                         })
                 elif obj_ref.get('type') in ['ICMPV4Object', 'ICMPV6Object']:
-                    # ICMP object - look it up
                     obj_name = obj_ref.get('name')
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
@@ -1201,11 +1189,9 @@ class MigrationExecutor:
                                 'reason': 'Not found in FMC'
                             })
             
-            # Handle literals (protocol-only like GRE, ESP)
             for literal in resolved_rule['destinationPorts'].get('literals', []):
                 resolved_literals.append(literal)
             
-            # Build final destinationPorts
             if resolved_ports or resolved_literals:
                 resolved_rule['destinationPorts'] = {}
                 if resolved_ports:
@@ -1225,15 +1211,19 @@ class MigrationExecutor:
                 'app_action': app_action
             })
         
-        # =====================================================================
-        # Zone inference based on resolved network addresses (v6.3)
-        # =====================================================================
+        # Check for unmapped users (v7)
+        unmapped_users = policy_data.get('users_unmapped', [])
+        for user_name in unmapped_users:
+            warnings.append({
+                'type': 'unmapped_user',
+                'user': user_name
+            })
+        
+        # Zone inference (v6.3)
         if self.zone_mapper:
-            # Get the resolved source and destination objects
             resolved_sources = resolved_rule.get('sourceNetworks', {}).get('objects', [])
             resolved_dests = resolved_rule.get('destinationNetworks', {}).get('objects', [])
             
-            # Infer zones from the actual network addresses
             source_zone, dest_zone, zone_warnings = self._resolve_zones_for_rule(
                 resolved_sources, resolved_dests, rule_name
             )
@@ -1252,7 +1242,6 @@ class MigrationExecutor:
                     'type': 'zone_mapping',
                     'message': zw
                 })
-                self.rules_with_zone_warnings += 1
         
         return resolved_rule, warnings
     
@@ -1287,6 +1276,13 @@ class MigrationExecutor:
             if policy_data.get('uses_service_group'):
                 rules_with_service_groups += 1
             
+            # Track user statistics (v7)
+            if 'users' in fmc_rule:
+                user_count = len(fmc_rule['users'].get('objects', []))
+                if user_count > 0:
+                    self.rules_with_users += 1
+                    self.total_users_applied += user_count
+            
             resolved_rule, rule_warnings = self._resolve_rule_objects(fmc_rule, policy_data)
             
             has_warnings = len(rule_warnings) > 0
@@ -1312,12 +1308,17 @@ class MigrationExecutor:
                     )
                     if 'applications' not in missing_elements:
                         missing_elements.append('applications')
+                elif warning['type'] == 'unmapped_user':
+                    # Log unmapped user warning
+                    print(f"  ⚠ [{policy_name}] unmapped_user: {warning.get('user', 'Unknown')}")
+                    if 'users' not in missing_elements:
+                        missing_elements.append('users')
                 elif warning['type'] == 'zone_mapping':
-                    # Zone mapping warnings are informational
                     print(f"  ⚠ [{policy_name}] zone: {warning.get('message', 'Unknown')}")
-                    continue  # Don't add to print below
+                    continue
                 
-                print(f"  ⚠ [{policy_name}] {warning['type']}: {warning.get('object', warning.get('application', 'Unknown'))}")
+                if warning['type'] not in ['zone_mapping', 'unmapped_user']:
+                    print(f"  ⚠ [{policy_name}] {warning['type']}: {warning.get('object', warning.get('application', 'Unknown'))}")
             
             result = self.fmc.create_access_rule(acp_id, resolved_rule)
             
@@ -1343,10 +1344,10 @@ class MigrationExecutor:
             print(f"ℹ {rules_with_apps} rules have applications ({total_apps_applied} total app references)")
         if rules_with_service_groups > 0:
             print(f"ℹ {rules_with_service_groups} rules use service groups")
+        if self.rules_with_users > 0:
+            print(f"ℹ {self.rules_with_users} rules have users ({self.total_users_applied} total user references)")
         if self.rules_with_zones > 0:
             print(f"ℹ {self.rules_with_zones} rules have zone mappings")
-        if self.rules_with_zone_warnings > 0:
-            print(f"⚠ {self.rules_with_zone_warnings} zone mapping warnings")
         if self.auto_created_groups > 0:
             print(f"ℹ Auto-created {self.auto_created_groups} network groups for rules exceeding 200 objects")
         if error_count > 0:
