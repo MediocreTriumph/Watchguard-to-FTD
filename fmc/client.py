@@ -243,3 +243,85 @@ class FMCClient:
                 'error': response.text,
                 'status_code': response.status_code
             }
+    
+    # =========================================================================
+    # Identity / Realm Methods (v7)
+    # =========================================================================
+    
+    def get_realms(self) -> List[Dict]:
+        """Get all identity realms configured in FMC."""
+        endpoint = f"{self.base_url}/domain/{self.domain_uuid}/object/realms"
+        return self.get_paginated(endpoint)
+    
+    def get_realm_users(self, realm_id: str) -> List[Dict]:
+        """
+        Get all users from a specific realm.
+        
+        Note: This returns users that FMC has discovered/cached from the
+        identity source (Active Directory, etc.). The list may not be
+        exhaustive - users appear here after they've been seen by the
+        identity services.
+        
+        Args:
+            realm_id: The realm UUID
+            
+        Returns:
+            List of realm user objects with 'id', 'name', 'realm' keys
+        """
+        endpoint = f"{self.base_url}/domain/{self.domain_uuid}/object/realms/{realm_id}/realmusers"
+        return self.get_paginated(endpoint)
+    
+    def get_realm_user_groups(self, realm_id: str) -> List[Dict]:
+        """
+        Get all user groups from a specific realm.
+        
+        Args:
+            realm_id: The realm UUID
+            
+        Returns:
+            List of realm user group objects
+        """
+        endpoint = f"{self.base_url}/domain/{self.domain_uuid}/object/realms/{realm_id}/realmusergroups"
+        return self.get_paginated(endpoint)
+    
+    def search_realm_users(self, realm_id: str, search_filter: str) -> List[Dict]:
+        """
+        Search for users in a realm by filter string.
+        
+        This can be used to find specific users when the full user list
+        is very large.
+        
+        Args:
+            realm_id: The realm UUID
+            search_filter: Search string (username or partial match)
+            
+        Returns:
+            List of matching user objects
+        """
+        endpoint = f"{self.base_url}/domain/{self.domain_uuid}/object/realms/{realm_id}/realmusers"
+        params = {'filter': f'name:{search_filter}'}
+        
+        response = self._make_request('GET', endpoint, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('items', [])
+        return []
+    
+    def get_realm_by_name(self, realm_name: str) -> Optional[Dict]:
+        """
+        Get a realm by its name.
+        
+        Args:
+            realm_name: The realm name (e.g., "AD" or "MyDomain")
+            
+        Returns:
+            Realm dict or None if not found
+        """
+        realms = self.get_realms()
+        
+        for realm in realms:
+            if realm.get('name', '').lower() == realm_name.lower():
+                return realm
+        
+        return None
