@@ -1,13 +1,22 @@
 """
-Improved application matching with domain-specific knowledge.
+Improved application matching with domain-specific knowledge and manual mapping support.
 
-Fixes the fuzzy matching problems like:
-- Adobe.com -> Audible.com (WRONG)
-- Apple Safari -> Apple Mail (WRONG)
-- Norton -> Notion (WRONG)
+Features:
+- Exact matching (case-insensitive)
+- Fuzzy matching with domain filtering
+- Manual mappings file support (JSON format)
+
+Manual mappings file format (JSON):
+{
+  "mappings": {
+    "WatchGuard App Name": "FMC Application Name",
+    "Another WG App": "Another FMC App"
+  }
+}
 """
 
 import re
+import json
 from typing import Dict, Optional, List, Tuple
 from difflib import SequenceMatcher
 from models import FMCObject, FMCObjects
@@ -16,11 +25,65 @@ from models import FMCObject, FMCObjects
 class ApplicationMapper:
     """Maps WatchGuard applications to FMC applications with smart matching."""
     
-    def __init__(self, fmc_objects: FMCObjects, confidence_threshold: float = 0.85):
+    def __init__(self, fmc_objects: FMCObjects, confidence_threshold: float = 0.85,
+                 manual_mappings_file: Optional[str] = None):
         self.fmc_objects = fmc_objects
         self.confidence_threshold = confidence_threshold
         self.app_mappings: Dict[str, FMCObject] = {}
         self.unmapped_apps: List[str] = []
+        
+        # Manual mappings: WG app name -> FMC app name (loaded from file)
+        self.manual_mappings: Dict[str, str] = {}
+        self.manual_mappings_applied: int = 0
+        self.manual_mappings_not_found: List[Tuple[str, str]] = []  # (wg_name, fmc_name)
+        
+        # Load manual mappings if file provided
+        if manual_mappings_file:
+            self._load_manual_mappings(manual_mappings_file)
+    
+    def _load_manual_mappings(self, filepath: str) -> None:
+        """Load manual application mappings from JSON file."""
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            
+            # Support both formats: {"mappings": {...}} or direct {...}
+            if 'mappings' in data:
+                self.manual_mappings = data['mappings']
+            else:
+                # Filter out comment keys
+                self.manual_mappings = {k: v for k, v in data.items() 
+                                         if not k.startswith('_')}
+            
+            print(f"\n  ✓ Loaded {len(self.manual_mappings)} manual application mappings from {filepath}")
+            
+        except FileNotFoundError:
+            print(f"\n  ⚠ Manual mappings file not found: {filepath}")
+        except json.JSONDecodeError as e:
+            print(f"\n  ⚠ Invalid JSON in manual mappings file: {e}")
+        except Exception as e:
+            print(f"\n  ⚠ Error loading manual mappings: {e}")
+    
+    def _apply_manual_mapping(self, wg_app: str) -> Optional[FMCObject]:
+        """
+        Try to apply a manual mapping for a WatchGuard app.
+        Returns the FMC object if found, None otherwise.
+        """
+        if wg_app not in self.manual_mappings:
+            return None
+        
+        fmc_app_name = self.manual_mappings[wg_app]
+        
+        # Look up the FMC application by name (case-insensitive)
+        fmc_obj = self.fmc_objects.applications.get(fmc_app_name.lower())
+        
+        if fmc_obj:
+            self.manual_mappings_applied += 1
+            return fmc_obj
+        else:
+            # Manual mapping specified but FMC app not found
+            self.manual_mappings_not_found.append((wg_app, fmc_app_name))
+            return None
     
     def map_applications(self, wg_app_names: List[str]) -> Dict[str, FMCObject]:
         """Map WatchGuard application names to FMC applications."""
@@ -30,6 +93,7 @@ class ApplicationMapper:
         
         exact_matches = 0
         fuzzy_matches = 0
+        manual_matches = 0
         no_matches = 0
         
         for wg_app in wg_app_names:
@@ -37,7 +101,9 @@ class ApplicationMapper:
             
             if mapping:
                 self.app_mappings[wg_app] = mapping['object']
-                if mapping['match_type'] == 'exact':
+                if mapping['match_type'] == 'manual':
+                    manual_matches += 1
+                elif mapping['match_type'] == 'exact':
                     exact_matches += 1
                 else:
                     fuzzy_matches += 1
@@ -46,18 +112,45 @@ class ApplicationMapper:
                 no_matches += 1
         
         print(f"\nResults:")
+        if manual_matches > 0:
+            print(f"  Manual matches: {manual_matches}")
         print(f"  Exact matches:  {exact_matches}")
         print(f"  Fuzzy matches:  {fuzzy_matches}")
         print(f"  No matches:     {no_matches}")
         
+        # Report manual mappings that couldn't be applied
+        if self.manual_mappings_not_found:
+            print(f"\n⚠ Manual mappings with FMC app not found ({len(self.manual_mappings_not_found)}):")
+            for wg_name, fmc_name in self.manual_mappings_not_found[:10]:
+                print(f"    {wg_name} → {fmc_name} (not in FMC)")
+            if len(self.manual_mappings_not_found) > 10:
+                print(f"    ... and {len(self.manual_mappings_not_found) - 10} more")
+        
         if fuzzy_matches > 0:
             self._show_fuzzy_examples()
+        
+        # Show remaining unmapped apps
+        if self.unmapped_apps:
+            print(f"\nUnmapped applications ({len(self.unmapped_apps)}):")
+            for app in self.unmapped_apps[:15]:
+                print(f"    - {app}")
+            if len(self.unmapped_apps) > 15:
+                print(f"    ... and {len(self.unmapped_apps) - 15} more")
         
         return self.app_mappings
     
     def _map_single_application(self, wg_app: str) -> Optional[Dict]:
         """Map a single application with smart matching."""
-        # 1. Try exact match (case-insensitive)
+        # 1. Try manual mapping first (highest priority)
+        manual_obj = self._apply_manual_mapping(wg_app)
+        if manual_obj:
+            return {
+                'object': manual_obj,
+                'match_type': 'manual',
+                'confidence': 1.0
+            }
+        
+        # 2. Try exact match (case-insensitive)
         exact = self._exact_match(wg_app)
         if exact:
             return {
@@ -66,7 +159,7 @@ class ApplicationMapper:
                 'confidence': 1.0
             }
         
-        # 2. Try fuzzy match with domain filtering
+        # 3. Try fuzzy match with domain filtering
         fuzzy = self._fuzzy_match_with_domain(wg_app)
         if fuzzy and fuzzy['confidence'] >= self.confidence_threshold:
             return fuzzy
@@ -231,5 +324,20 @@ class ApplicationMapper:
         return {
             "total_wg_apps": len(self.app_mappings) + len(self.unmapped_apps),
             "mapped": len(self.app_mappings),
-            "unmapped": len(self.unmapped_apps)
+            "unmapped": len(self.unmapped_apps),
+            "manual_applied": self.manual_mappings_applied,
+            "manual_not_found": len(self.manual_mappings_not_found)
+        }
+    
+    def get_report(self) -> Dict:
+        """Get detailed mapping report for JSON export."""
+        return {
+            "statistics": self.get_statistics(),
+            "manual_mappings_loaded": len(self.manual_mappings),
+            "manual_mappings_applied": self.manual_mappings_applied,
+            "manual_mappings_not_found": [
+                {"wg_app": wg, "fmc_app": fmc} 
+                for wg, fmc in self.manual_mappings_not_found
+            ],
+            "unmapped_apps": self.unmapped_apps
         }
