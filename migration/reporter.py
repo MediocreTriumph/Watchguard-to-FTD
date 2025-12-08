@@ -6,6 +6,7 @@ generates a comprehensive migration_report.json file.
 
 Updated for v5 parser with service group support.
 Updated for v6 with interface discovery and zone mapping.
+Updated for v7 with user mapping support.
 """
 
 import json
@@ -48,6 +49,14 @@ class UnmappedApplication:
     application: str
     app_action: str
     reason: str = "No FMC match found"
+
+
+@dataclass
+class UnmappedUser:
+    """Record of an unmapped user (v7)."""
+    rule: str
+    user: str
+    reason: str = "No FMC realm user match found"
 
 
 @dataclass
@@ -107,6 +116,7 @@ class MigrationReporter:
         reporter.rule_failed("Block-All", "Invalid action", original, resolved)
         reporter.rule_warning_unresolved("MyRule", "BadObject", "destination")
         reporter.rule_warning_unmapped_app("MyRule", "CustomApp", "Allow-Apps")
+        reporter.rule_warning_unmapped_user("MyRule", "DOMAIN\\jdoe.1")
         
         # At end
         reporter.save_report()  # Prints absolute path and creates migration_report.json
@@ -136,6 +146,10 @@ class MigrationReporter:
         self._interface_aliases_skipped: List[InterfaceAliasSkipped] = []
         self._groups_with_skipped_interfaces: List[GroupWithSkippedInterfaces] = []
         self.zone_mapping_report: Optional[Dict] = None
+        
+        # User mapping tracking (v7)
+        self._unmapped_users: List[UnmappedUser] = []
+        self.user_mapping_report: Optional[Dict] = None
         
         # Detailed records
         self._object_failures: List[ObjectFailure] = []
@@ -257,6 +271,18 @@ class MigrationReporter:
             self._rules_with_warnings += 1
             self._warned_rules.add(rule_name)
     
+    def rule_warning_unmapped_user(self, rule_name: str, user: str,
+                                    reason: str = "No FMC realm user match found"):
+        """Record warning for unmapped user in rule (v7)."""
+        self._unmapped_users.append(UnmappedUser(
+            rule=rule_name,
+            user=user,
+            reason=reason
+        ))
+        if rule_name not in self._warned_rules:
+            self._rules_with_warnings += 1
+            self._warned_rules.add(rule_name)
+    
     def rule_warning_unresolved(self, rule_name: str, object_name: str, 
                                  field: str, reason: str = "Not found in FMC"):
         """Record warning for unresolved object in rule."""
@@ -317,6 +343,10 @@ class MigrationReporter:
         if self._groups_with_skipped_interfaces:
             summary["groups_with_skipped_interface_members"] = len(self._groups_with_skipped_interfaces)
         
+        # Add user mapping stats (v7)
+        if self._unmapped_users:
+            summary["unmapped_users"] = len(self._unmapped_users)
+        
         return summary
     
     def get_errors(self) -> Dict[str, List[Dict]]:
@@ -343,6 +373,10 @@ class MigrationReporter:
                 {"rule": w.rule, "application": w.application, 
                  "app_action": w.app_action, "reason": w.reason}
                 for w in self._unmapped_applications
+            ],
+            "unmapped_users": [
+                {"rule": w.rule, "user": w.user, "reason": w.reason}
+                for w in self._unmapped_users
             ],
             "unresolved_objects": [
                 {"rule": w.rule, "object": w.object, 
@@ -425,6 +459,10 @@ class MigrationReporter:
         if self.zone_mapping_report:
             report["interface_mapping"] = self.zone_mapping_report
         
+        # Include user mapping report if available (v7)
+        if self.user_mapping_report:
+            report["user_mapping"] = self.user_mapping_report
+        
         return report
     
     def save_report(self, directory: str = ".") -> str:
@@ -495,6 +533,16 @@ class MigrationReporter:
             if zones:
                 print(f"   FMC Zones: {', '.join(zones)}")
         
+        # User mapping summary (v7)
+        if self.user_mapping_report:
+            um = self.user_mapping_report
+            stats = um.get('statistics', {})
+            total_users = stats.get('wg_users_found', 0)
+            matched = stats.get('exact_matches', 0) + stats.get('normalized_matches', 0) + stats.get('fuzzy_matches', 0)
+            unmatched = stats.get('unmatched', 0)
+            if total_users > 0:
+                print(f"   User Mapping: {matched}/{total_users} matched, {unmatched} unmatched")
+        
         errors = report["errors"]
         warnings = report["warnings"]
         
@@ -503,6 +551,7 @@ class MigrationReporter:
                        len(errors["group_creation_failures"]))
         
         total_warnings = (len(warnings["unmapped_applications"]) + 
+                         len(warnings["unmapped_users"]) +
                          len(warnings["unresolved_objects"]) + 
                          len(warnings["incomplete_rules"]))
         
@@ -519,6 +568,8 @@ class MigrationReporter:
             print(f"\n⚠️  Warnings: {total_warnings}")
             if warnings["unmapped_applications"]:
                 print(f"   - Unmapped applications: {len(warnings['unmapped_applications'])}")
+            if warnings["unmapped_users"]:
+                print(f"   - Unmapped users: {len(warnings['unmapped_users'])}")
             if warnings["unresolved_objects"]:
                 print(f"   - Unresolved objects: {len(warnings['unresolved_objects'])}")
             if warnings["incomplete_rules"]:

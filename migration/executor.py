@@ -1309,7 +1309,10 @@ class MigrationExecutor:
                     if 'applications' not in missing_elements:
                         missing_elements.append('applications')
                 elif warning['type'] == 'unmapped_user':
-                    # Log unmapped user warning
+                    # Log unmapped user warning (v7)
+                    self.reporter.rule_warning_unmapped_user(
+                        policy_name, warning.get('user', 'Unknown')
+                    )
                     print(f"  ⚠ [{policy_name}] unmapped_user: {warning.get('user', 'Unknown')}")
                     if 'users' not in missing_elements:
                         missing_elements.append('users')
