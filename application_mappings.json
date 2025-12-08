@@ -1,0 +1,18 @@
+{
+  "_comment": "Manual application mappings from WatchGuard app names to FMC application names",
+  "_usage": "Use with --app-mappings application_mappings.json",
+  "mappings": {
+    "Outlook.com": "Outlook",
+    "iTunes/App Store": "iTunes",
+    "VLC": "VLC Media Player",
+    "Weather Channel": "Weather.com",
+    "WSJ Live": "Wall Street Journal",
+    "Norton": "Norton AntiVirus",
+    "MS Remote Desktop Protocol": "RDP",
+    "Apple Safari": "Safari",
+    "Adobe.com": "Adobe Software",
+    "Google Docs": "Google Workspace",
+    "Facebook MediaUpload": "Facebook Upload",
+    "Facebook Share": "Facebook Post"
+  }
+}

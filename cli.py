@@ -4,6 +4,7 @@ WatchGuard to Cisco FTD Migration Tool - CLI Entry Point
 
 Updated for v6 with interface discovery and zone mapping.
 Updated for v7 with existing ACP support and user mapping.
+Updated for v8 with manual application mappings support.
 """
 
 import sys
@@ -53,6 +54,20 @@ Examples:
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
       --fmc-user admin --fmc-pass password --execute \\
       --existing-acp "My-Existing-Policy" --enable-users
+      
+  # Execute with manual application mappings
+  python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
+      --fmc-user admin --fmc-pass password --execute \\
+      --new-acp "Migrated-WG-Policy" --app-mappings app_mappings.json
+
+Application Mappings File Format (JSON):
+  {
+    "mappings": {
+      "WatchGuard App Name": "FMC Application Name",
+      "Outlook.com": "Outlook",
+      "iTunes/App Store": "iTunes"
+    }
+  }
         '''
     )
     
@@ -87,9 +102,11 @@ Examples:
     parser.add_argument('--user-confidence', type=float, default=0.85,
                        help='User matching confidence threshold (default: 0.85)')
     
-    # Matching options
+    # Application matching options (v8)
     parser.add_argument('--app-confidence', type=float, default=0.85,
                        help='Application matching confidence threshold (default: 0.85)')
+    parser.add_argument('--app-mappings', type=str, default=None,
+                       help='Path to JSON file with manual application mappings')
     
     args = parser.parse_args()
     
@@ -116,7 +133,8 @@ Examples:
             enable_zones=args.enable_zones, 
             use_existing_acp=use_existing_acp,
             enable_users=args.enable_users,
-            user_confidence=args.user_confidence
+            user_confidence=args.user_confidence,
+            app_mappings_file=args.app_mappings
         )
         sys.exit(0 if success else 1)
     except Exception as e:
@@ -128,7 +146,7 @@ Examples:
 
 def run_migration(config: MigrationConfig, enable_zones: bool = False,
                   use_existing_acp: bool = False, enable_users: bool = False,
-                  user_confidence: float = 0.85) -> bool:
+                  user_confidence: float = 0.85, app_mappings_file: str = None) -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -145,6 +163,8 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
         print(f"Zone Mapping: ENABLED")
     if enable_users:
         print(f"User Mapping: ENABLED")
+    if app_mappings_file:
+        print(f"App Mappings File: {app_mappings_file}")
     
     # Step 1: Load WatchGuard configuration
     print("\n" + "="*60)
@@ -289,7 +309,12 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     
     print(f"  Found {len(unique_apps)} unique applications in {len(wg_config.app_actions)} app actions")
     
-    app_mapper = ApplicationMapper(fmc_objects, config.app_match_confidence_threshold)
+    # Create app mapper with optional manual mappings file
+    app_mapper = ApplicationMapper(
+        fmc_objects, 
+        config.app_match_confidence_threshold,
+        manual_mappings_file=app_mappings_file
+    )
     app_mapper.map_applications(sorted(unique_apps))
     
     # Step 7: Build migration plan
@@ -307,7 +332,7 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("="*60)
     
     plan_file = "migration_plan.json"
-    save_migration_plan(plan, plan_file, zone_mapper, user_mapper)
+    save_migration_plan(plan, plan_file, zone_mapper, user_mapper, app_mapper)
     print(f"\n✓ Migration plan saved to: {plan_file}")
     
     # Show application mapping summary
@@ -342,7 +367,7 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     return success
 
 
-def save_migration_plan(plan, filename: str, zone_mapper=None, user_mapper=None):
+def save_migration_plan(plan, filename: str, zone_mapper=None, user_mapper=None, app_mapper=None):
     """Save migration plan to JSON file."""
     # Convert plan to serializable format
     plan_data = {
@@ -380,6 +405,10 @@ def save_migration_plan(plan, filename: str, zone_mapper=None, user_mapper=None)
     # Add user mapping data if available (v7)
     if user_mapper:
         plan_data['user_mapping'] = user_mapper.get_report()
+    
+    # Add application mapping report if available (v8)
+    if app_mapper and hasattr(app_mapper, 'get_report'):
+        plan_data['application_mapping'] = app_mapper.get_report()
     
     with open(filename, 'w') as f:
         json.dump(plan_data, f, indent=2)
