@@ -5,6 +5,9 @@ WatchGuard stores users in aliases/groups as "DOMAIN\\username" format.
 FMC stores realm users with realm references and various name formats.
 
 This module handles the fuzzy matching between the two systems.
+
+Note: WatchGuard appends version suffixes like ".1", ".2" to user entries.
+These are stripped during normalization for matching.
 """
 
 import re
@@ -52,9 +55,11 @@ class UserMapper:
     
     WatchGuard user formats:
     - "DOMAIN\\username"
+    - "DOMAIN\\username.1" (with version suffix)
     - "DOMAIN\\First Last"
     - "username@domain.com"
     - "username"
+    - "ADM-SRV-jdoe.1" (service accounts with version suffix)
     
     FMC realm user formats vary by identity source configuration.
     """
@@ -141,7 +146,7 @@ class UserMapper:
                 name_lower = user.name.lower()
                 self._user_by_name[name_lower] = user
                 
-                # Also index by normalized name (no domain prefix)
+                # Also index by normalized name (no domain prefix, no version suffix)
                 normalized = self._normalize_username(user.name)
                 self._user_by_normalized[normalized] = user
             
@@ -173,9 +178,13 @@ class UserMapper:
         
         Handles various formats:
         - "DOMAIN\\username" -> "username"
+        - "DOMAIN\\username.1" -> "username" (strips .N version suffix)
         - "username@domain.com" -> "username"
         - "First Last" -> "first last"
-        - Removes special characters
+        - "ADM-SRV-jdoe.1" -> "adm-srv-jdoe" (strips .N suffix)
+        
+        WatchGuard appends version suffixes like ".1", ".2" to user entries.
+        These need to be stripped for matching against FMC realm users.
         """
         if not username:
             return ""
@@ -189,6 +198,10 @@ class UserMapper:
         # Remove domain suffix (username@domain.com)
         if '@' in normalized:
             normalized = normalized.split('@')[0]
+        
+        # Strip WatchGuard version suffix (.1, .2, .10, etc.)
+        # Match pattern: ends with .N where N is one or more digits
+        normalized = re.sub(r'\.\d+$', '', normalized)
         
         return normalized
     
@@ -250,7 +263,7 @@ class UserMapper:
                 match_method='exact'
             )
         
-        # Try normalized match (strip domain)
+        # Try normalized match (strip domain AND version suffix like .1)
         normalized = self._normalize_username(wg_user)
         if normalized in self._user_by_normalized:
             return UserMapping(
@@ -281,7 +294,7 @@ class UserMapper:
             )
         
         # No match found
-        warnings.append(f"No FMC realm user found for '{wg_user}'")
+        warnings.append(f"No FMC realm user found for '{wg_user}' (normalized: '{normalized}')")
         return UserMapping(
             wg_user=wg_user,
             fmc_user=None,
@@ -332,14 +345,16 @@ class UserMapper:
         print(f"    Fuzzy matches:      {self.stats['fuzzy_matches']}")
         print(f"    Unmatched:          {self.stats['unmatched']}")
         
-        # Show some unmatched users
-        unmatched = [u for u, m in self.user_mappings.items() if not m.fmc_user]
+        # Show some unmatched users with their normalized forms
+        unmatched = [(u, m) for u, m in self.user_mappings.items() if not m.fmc_user]
         if unmatched:
-            print(f"\n  Unmatched users (first 5):")
-            for u in unmatched[:5]:
+            print(f"\n  Unmatched users (first 10):")
+            for u, m in unmatched[:10]:
+                normalized = self._normalize_username(u)
                 print(f"    - {u}")
-            if len(unmatched) > 5:
-                print(f"    ... and {len(unmatched) - 5} more")
+                print(f"      normalized: '{normalized}'")
+            if len(unmatched) > 10:
+                print(f"    ... and {len(unmatched) - 10} more")
     
     def get_report(self) -> Dict:
         """Get a report dict for inclusion in migration output."""
@@ -355,9 +370,16 @@ class UserMapper:
                     'fmc_user_id': m.fmc_user.id if m.fmc_user else None,
                     'realm': m.fmc_user.realm_name if m.fmc_user else None,
                     'confidence': m.match_confidence,
-                    'method': m.match_method
+                    'method': m.match_method,
+                    'normalized_input': self._normalize_username(wg)
                 }
                 for wg, m in self.user_mappings.items()
             },
-            'unmatched': [u for u, m in self.user_mappings.items() if not m.fmc_user]
+            'unmatched': [
+                {
+                    'original': u, 
+                    'normalized': self._normalize_username(u)
+                } 
+                for u, m in self.user_mappings.items() if not m.fmc_user
+            ]
         }
