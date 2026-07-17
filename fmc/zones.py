@@ -136,10 +136,12 @@ class ZoneMapper:
     - Public addresses → OUTSIDE zone
     """
     
-    EXPECTED_ZONES = ["INSIDE", "OUTSIDE"]
-    
-    def __init__(self, fmc_client):
+    def __init__(self, fmc_client, inside_zone: str = "INSIDE",
+                 outside_zone: str = "OUTSIDE"):
         self.fmc = fmc_client
+        self.inside_zone_name = inside_zone
+        self.outside_zone_name = outside_zone
+        self.expected_zones = [inside_zone, outside_zone]
         self.fmc_zones: Dict[str, FMCObject] = {}
         self.report = ZoneMappingReport()
         
@@ -173,8 +175,8 @@ class ZoneMapper:
         
         # Cache zone references
         missing = []
-        for expected in self.EXPECTED_ZONES:
-            zone_obj = self.fmc_zones.get(expected.upper())
+        for expected in self.expected_zones:
+            zone_obj = self.fmc_zones.get(expected) or self.fmc_zones.get(expected.upper())
             if not zone_obj:
                 missing.append(expected)
             else:
@@ -183,17 +185,17 @@ class ZoneMapper:
                     "id": zone_obj.id,
                     "type": "SecurityZone"
                 }
-                if expected.upper() == "INSIDE":
+                if expected == self.inside_zone_name:
                     self._inside_zone_ref = zone_ref
-                elif expected.upper() == "OUTSIDE":
+                elif expected == self.outside_zone_name:
                     self._outside_zone_ref = zone_ref
-        
+
         if missing:
             print(f"  ⚠ Missing expected zones: {', '.join(missing)}")
             return False
-        
-        print(f"  ✓ INSIDE zone: {self._inside_zone_ref['id']}")
-        print(f"  ✓ OUTSIDE zone: {self._outside_zone_ref['id']}")
+
+        print(f"  ✓ Inside zone '{self.inside_zone_name}': {self._inside_zone_ref['id']}")
+        print(f"  ✓ Outside zone '{self.outside_zone_name}': {self._outside_zone_ref['id']}")
         return True
     
     def load_wg_object_values(self, wg_config):
@@ -339,7 +341,7 @@ class ZoneMapper:
         if self._inside_zone_ref and self._outside_zone_ref:
             print(f"\n✓ Zone inference ready")
             print(f"  Object values loaded: {len(self._wg_object_values)}")
-            print(f"  RFC1918/private → INSIDE")
-            print(f"  Public/global → OUTSIDE")
+            print(f"  RFC1918/private → {self.inside_zone_name}")
+            print(f"  Public/global → {self.outside_zone_name}")
         else:
             print(f"\n⚠ Zone inference not available")

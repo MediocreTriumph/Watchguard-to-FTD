@@ -847,7 +847,8 @@ def build_service_lookup(config):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: ./watchparse-json-v5.py <config.xml>")
+        from pathlib import Path
+        print(f"Usage: ./{Path(sys.argv[0]).name} <config.xml>")
         sys.exit(1)
     
     xml_file = sys.argv[1]

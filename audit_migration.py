@@ -6,16 +6,18 @@ Compares WatchGuard configuration with migrated FMC Access Control Policy
 to identify missing or incomplete policy migrations.
 
 Usage:
+    export FMC_PASSWORD='...'   # or omit to be prompted
     python audit_migration.py watchguard_config.json \
         --fmc-host 192.168.255.20 \
         --fmc-user admin \
-        --fmc-pass password \
         --acp-name "Migrated-WG-Policy" \
         --no-verify-ssl
 """
 
+import os
 import sys
 import json
+import getpass
 import argparse
 from models import WatchGuardConfig
 from fmc.client import FMCClient
@@ -34,7 +36,9 @@ def main():
     # FMC connection
     parser.add_argument('--fmc-host', required=True, help='FMC hostname or IP')
     parser.add_argument('--fmc-user', required=True, help='FMC username')
-    parser.add_argument('--fmc-pass', required=True, help='FMC password')
+    parser.add_argument('--fmc-pass', default=None,
+                       help='FMC password (prefer FMC_PASSWORD env var or '
+                            'interactive prompt)')
     parser.add_argument('--no-verify-ssl', action='store_true',
                        help='Disable SSL verification')
     
@@ -45,7 +49,12 @@ def main():
                        help='Output file for audit report')
     
     args = parser.parse_args()
-    
+
+    # Resolve password: --fmc-pass > FMC_PASSWORD env var > interactive prompt
+    fmc_password = args.fmc_pass or os.environ.get('FMC_PASSWORD')
+    if not fmc_password:
+        fmc_password = getpass.getpass('FMC password: ')
+
     try:
         # Load WatchGuard configuration
         print("="*60)
@@ -66,7 +75,7 @@ def main():
         fmc_client = FMCClient(
             args.fmc_host,
             args.fmc_user,
-            args.fmc_pass,
+            fmc_password,
             verify_ssl=not args.no_verify_ssl
         )
         

@@ -7,8 +7,10 @@ Updated for v7 with existing ACP support and user mapping.
 Updated for v8 with manual application mappings support.
 """
 
+import os
 import sys
 import json
+import getpass
 import argparse
 from pathlib import Path
 
@@ -30,34 +32,39 @@ def main():
         description='Migrate WatchGuard configuration to Cisco FMC',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
+Password: supply via the FMC_PASSWORD environment variable, or omit
+--fmc-pass to be prompted interactively. Avoid --fmc-pass on the command
+line (visible in shell history and process lists).
+
 Examples:
   # Dry run (default) - builds plan but doesn't create anything
+  export FMC_PASSWORD='...'
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
-      --fmc-user admin --fmc-pass password --dry-run
+      --fmc-user admin
 
   # Execute migration to a NEW Access Control Policy
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
-      --fmc-user admin --fmc-pass password --execute \\
+      --fmc-user admin --execute \\
       --new-acp "Migrated-WG-Policy"
       
   # Execute migration to an EXISTING Access Control Policy
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
-      --fmc-user admin --fmc-pass password --execute \\
+      --fmc-user admin --execute \\
       --existing-acp "My-Existing-Policy"
       
   # Execute with zone mapping (assumes INSIDE/OUTSIDE zones exist)
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
-      --fmc-user admin --fmc-pass password --execute \\
+      --fmc-user admin --execute \\
       --new-acp "Migrated-WG-Policy" --enable-zones
       
   # Execute with user mapping (requires identity policy/realm configured)
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
-      --fmc-user admin --fmc-pass password --execute \\
+      --fmc-user admin --execute \\
       --existing-acp "My-Existing-Policy" --enable-users
       
   # Execute with manual application mappings
   python cli.py watchguard_config.json --fmc-host 192.168.255.122 \\
-      --fmc-user admin --fmc-pass password --execute \\
+      --fmc-user admin --execute \\
       --new-acp "Migrated-WG-Policy" --app-mappings app_mappings.json
 
 Application Mappings File Format (JSON):
@@ -77,8 +84,11 @@ Application Mappings File Format (JSON):
     # FMC connection
     parser.add_argument('--fmc-host', required=True, help='FMC hostname or IP')
     parser.add_argument('--fmc-user', required=True, help='FMC username')
-    parser.add_argument('--fmc-pass', required=True, help='FMC password')
-    parser.add_argument('--no-verify-ssl', action='store_true', 
+    parser.add_argument('--fmc-pass', default=None,
+                       help='FMC password (prefer FMC_PASSWORD env var or '
+                            'interactive prompt; passing on the command line '
+                            'exposes it in shell history and process lists)')
+    parser.add_argument('--no-verify-ssl', action='store_true',
                        help='Disable SSL verification (for self-signed certs)')
     
     # Migration options - mutually exclusive ACP options
@@ -88,13 +98,16 @@ Application Mappings File Format (JSON):
     acp_group.add_argument('--existing-acp',
                        help='Name or UUID of existing Access Control Policy to add rules to')
     parser.add_argument('--execute', action='store_true',
-                       help='Execute migration (default is dry-run)')
-    parser.add_argument('--dry-run', action='store_true', default=True,
-                       help='Dry run mode - build plan but don\'t create objects')
-    
+                       help='Execute migration (default is dry-run: build plan '
+                            'but don\'t create objects)')
+
     # Zone mapping options (v6)
     parser.add_argument('--enable-zones', action='store_true',
-                       help='Enable interface-to-zone mapping (requires INSIDE/OUTSIDE zones in FMC)')
+                       help='Enable interface-to-zone mapping (zones must exist in FMC)')
+    parser.add_argument('--zone-inside', default='INSIDE',
+                       help='Name of FMC security zone for internal networks (default: INSIDE)')
+    parser.add_argument('--zone-outside', default='OUTSIDE',
+                       help='Name of FMC security zone for external networks (default: OUTSIDE)')
     
     # User mapping options (v7)
     parser.add_argument('--enable-users', action='store_true',
@@ -109,17 +122,22 @@ Application Mappings File Format (JSON):
                        help='Path to JSON file with manual application mappings')
     
     args = parser.parse_args()
-    
+
+    # Resolve password: --fmc-pass > FMC_PASSWORD env var > interactive prompt
+    fmc_password = args.fmc_pass or os.environ.get('FMC_PASSWORD')
+    if not fmc_password:
+        fmc_password = getpass.getpass('FMC password: ')
+
     # Determine ACP name - default to creating new if neither specified
     acp_name = args.new_acp or args.existing_acp or 'Migrated-WG-Policy'
     use_existing_acp = args.existing_acp is not None
-    
+
     # Build configuration
     config = MigrationConfig(
         watchguard_config_file=args.config_file,
         fmc_host=args.fmc_host,
         fmc_username=args.fmc_user,
-        fmc_password=args.fmc_pass,
+        fmc_password=fmc_password,
         verify_ssl=not args.no_verify_ssl,
         new_acp_name=acp_name,
         dry_run=not args.execute,
@@ -129,12 +147,14 @@ Application Mappings File Format (JSON):
     # Run migration
     try:
         success = run_migration(
-            config, 
-            enable_zones=args.enable_zones, 
+            config,
+            enable_zones=args.enable_zones,
             use_existing_acp=use_existing_acp,
             enable_users=args.enable_users,
             user_confidence=args.user_confidence,
-            app_mappings_file=args.app_mappings
+            app_mappings_file=args.app_mappings,
+            zone_inside=args.zone_inside,
+            zone_outside=args.zone_outside
         )
         sys.exit(0 if success else 1)
     except Exception as e:
@@ -146,7 +166,8 @@ Application Mappings File Format (JSON):
 
 def run_migration(config: MigrationConfig, enable_zones: bool = False,
                   use_existing_acp: bool = False, enable_users: bool = False,
-                  user_confidence: float = 0.85, app_mappings_file: str = None) -> bool:
+                  user_confidence: float = 0.85, app_mappings_file: str = None,
+                  zone_inside: str = 'INSIDE', zone_outside: str = 'OUTSIDE') -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -236,12 +257,13 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
         print("STEP 3.5: ZONE MAPPING")
         print("="*60)
         
-        zone_mapper = ZoneMapper(fmc_client)
-        
+        zone_mapper = ZoneMapper(fmc_client, inside_zone=zone_inside,
+                                 outside_zone=zone_outside)
+
         # Discover FMC zones
         zones_ok = zone_mapper.discover_fmc_zones()
         if not zones_ok:
-            print("  ⚠ Expected zones (INSIDE/OUTSIDE) not found - zone mapping disabled")
+            print(f"  ⚠ Expected zones ({zone_inside}/{zone_outside}) not found - zone mapping disabled")
             zone_mapper = None
         else:
             # Load WatchGuard object values for zone inference
@@ -328,7 +350,7 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     
     # Step 8: Save plan to file
     print("\n" + "="*60)
-    print("SAVING MIGRATION PLAN")
+    print("STEP 8: SAVING MIGRATION PLAN")
     print("="*60)
     
     plan_file = "migration_plan.json"
@@ -355,7 +377,7 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     
     # Step 9: Execute migration
     print("\n" + "="*60)
-    print("STEP 8: EXECUTING MIGRATION")
+    print("STEP 9: EXECUTING MIGRATION")
     print("="*60)
     print("\n⚠  This will create objects in FMC")
     
