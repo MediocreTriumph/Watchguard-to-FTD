@@ -197,6 +197,11 @@ class WatchGuardPolicy:
     nat_policy: Optional[str] = None
     app_action: Optional[str] = None
     schedule: str = "Always On"
+
+    # Raw alias names before resolution (v9) - needed by the classifier,
+    # since interface aliases like 'Firebox' resolve to no address members.
+    source_aliases: List[str] = field(default_factory=list)
+    destination_aliases: List[str] = field(default_factory=list)
     
     @property
     def has_app_control(self) -> bool:
@@ -317,7 +322,9 @@ class WatchGuardConfig:
                 log_enabled=p.get("log_enabled", "false") == "true",
                 nat_policy=p.get("nat_policy"),
                 app_action=p.get("app_action"),
-                schedule=p.get("schedule", "Always On")
+                schedule=p.get("schedule", "Always On"),
+                source_aliases=p.get("source_aliases", []),
+                destination_aliases=p.get("destination_aliases", [])
             )
             for p in data.get("policies", [])
         ]

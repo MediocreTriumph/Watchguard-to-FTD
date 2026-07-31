@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<profile>
+  <service-list>
+    <service>
+      <name>HTTP-Custom</name>
+      <description>Custom web service</description>
+      <service-item>
+        <member>
+          <protocol>6</protocol>
+          <server-port>8080</server-port>
+        </member>
+      </service-item>
+    </service>
+    <service>
+      <name>PDQ</name>
+      <description>PDQ deploy - multi-protocol</description>
+      <service-item>
+        <member>
+          <protocol>6</protocol>
+          <server-port>139</server-port>
+        </member>
+        <member>
+          <protocol>17</protocol>
+          <server-port>137</server-port>
+        </member>
+      </service-item>
+    </service>
+    <service>
+      <name>Ping</name>
+      <description>ICMP echo</description>
+      <service-item>
+        <member>
+          <protocol>1</protocol>
+        </member>
+      </service-item>
+    </service>
+    <service>
+      <name>WG-Fireware-WebUI</name>
+      <description>WatchGuard management UI</description>
+      <service-item>
+        <member>
+          <protocol>6</protocol>
+          <server-port>8080</server-port>
+        </member>
+      </service-item>
+    </service>
+  </service-list>
+
+  <address-group-list>
+    <address-group>
+      <name>WebServer</name>
+      <description>Primary web server</description>
+      <addr-group-member>
+        <member>
+          <host-ip-addr>10.0.1.10</host-ip-addr>
+        </member>
+      </addr-group-member>
+    </address-group>
+    <address-group>
+      <name>LAN-Net</name>
+      <description>Internal network</description>
+      <addr-group-member>
+        <member>
+          <ip-network-addr>10.0.0.0</ip-network-addr>
+          <ip-mask>255.255.0.0</ip-mask>
+        </member>
+      </addr-group-member>
+    </address-group>
+  </address-group-list>
+
+  <alias-list>
+    <alias>
+      <name>Trusted-Hosts</name>
+      <description>Trusted internal hosts</description>
+      <alias-member-list>
+        <alias-member>
+          <type>1</type>
+          <address>WebServer</address>
+        </alias-member>
+        <alias-member>
+          <type>1</type>
+          <address>LAN-Net</address>
+        </alias-member>
+      </alias-member-list>
+    </alias>
+    <alias>
+      <name>Web-Servers</name>
+      <alias-member-list>
+        <alias-member>
+          <type>1</type>
+          <address>WebServer</address>
+        </alias-member>
+      </alias-member-list>
+    </alias>
+    <alias>
+      <name>Firebox</name>
+      <alias-member-list>
+        <alias-member>
+          <type>2</type>
+          <interface>eth0</interface>
+        </alias-member>
+      </alias-member-list>
+    </alias>
+    <alias>
+      <name>Any-Trusted</name>
+      <alias-member-list>
+        <alias-member>
+          <type>2</type>
+          <interface>eth1</interface>
+        </alias-member>
+      </alias-member-list>
+    </alias>
+  </alias-list>
+
+  <abs-policy-list>
+    <abs-policy>
+      <name>Allow Web Traffic</name>
+      <from-alias-list>
+        <alias>Trusted-Hosts</alias>
+      </from-alias-list>
+      <to-alias-list>
+        <alias>Web-Servers</alias>
+      </to-alias-list>
+      <service>HTTP-Custom</service>
+      <enabled>true</enabled>
+      <firewall>allow</firewall>
+      <settings>
+        <log-enabled>true</log-enabled>
+      </settings>
+    </abs-policy>
+    <abs-policy>
+      <name>WatchGuard Web UI</name>
+      <from-alias-list>
+        <alias>Any-Trusted</alias>
+      </from-alias-list>
+      <to-alias-list>
+        <alias>Firebox</alias>
+      </to-alias-list>
+      <service>WG-Fireware-WebUI</service>
+      <enabled>true</enabled>
+      <firewall>allow</firewall>
+    </abs-policy>
+    <abs-policy>
+      <name>Ping To Firebox</name>
+      <from-alias-list>
+        <alias>Any-Trusted</alias>
+      </from-alias-list>
+      <to-alias-list>
+        <alias>Firebox</alias>
+      </to-alias-list>
+      <service>Ping</service>
+      <enabled>true</enabled>
+      <firewall>allow</firewall>
+    </abs-policy>
+    <abs-policy>
+      <name>Unhandled Internal Packet</name>
+      <from-alias-list>
+        <alias>Any-Trusted</alias>
+      </from-alias-list>
+      <to-alias-list>
+        <alias>Any</alias>
+      </to-alias-list>
+      <service>Any</service>
+      <enabled>true</enabled>
+      <firewall>deny</firewall>
+    </abs-policy>
+  </abs-policy-list>
+</profile>

@@ -49,7 +49,17 @@ python watchparse-xlsx-v5_4.py config.xml
 
 ## Step 2: Dry run
 
-Dry run is the default. It connects to FMC, discovers existing objects, builds the full plan, and writes `migration_plan.json` — but creates nothing.
+Dry run is the default. It connects to FMC, discovers existing objects, classifies policies, builds the full plan, and writes `migration_plan.json` — but creates nothing.
+
+**Policy classification:** WatchGuard management-plane policies (Web UI, cert portal, Ping To Firebox, anything to/from the Firebox itself) and built-in default-deny rules (Unhandled Internal/External Packet) are skipped by default — FTD handles those outside the ACP. Each skip is listed in the output and in the plan file with a reason. Use `--include-management` to migrate them anyway.
+
+**The plan file is executable.** `migration_plan.json` contains everything needed to run the migration. Review it, hand-edit it if you like (e.g. delete a rule from `policies_to_create`), then execute it directly — no re-planning:
+
+```bash
+python cli.py --from-plan migration_plan.json                    # validate (offline)
+python cli.py --from-plan migration_plan.json --execute \
+    --fmc-host <ip> --fmc-user admin --new-acp "Migrated-WG-Policy"
+```
 
 ```bash
 export FMC_PASSWORD='...'
@@ -81,6 +91,8 @@ python cli.py <parsed>.json --fmc-host <ip> --fmc-user admin \
 | `--zone-inside <name>` | FMC zone for internal/RFC1918 networks (default `INSIDE`). |
 | `--zone-outside <name>` | FMC zone for external/public networks (default `OUTSIDE`). |
 | `--fmc-pass <pw>` | FMC password. Prefer `FMC_PASSWORD` env var or the interactive prompt. |
+| `--include-management` | Also migrate management-plane and default-deny policies (skipped by default). |
+| `--from-plan <file>` | Execute a saved (optionally hand-edited) plan file instead of re-planning. Without `--execute`, validates the file offline. |
 | `--enable-users` | Map WatchGuard user aliases to FMC realm users. Requires an identity realm configured in FMC. |
 | `--user-confidence <0-1>` | User match threshold (default 0.85). |
 | `--app-confidence <0-1>` | Application match threshold (default 0.85). |
@@ -138,12 +150,23 @@ fmc/
   zones.py              Interface → zone mapping
   user_mapper.py        WG aliases → FMC realm users
 migration/
+  classifier.py         Tags policies traffic/management-plane/default-deny
   planner.py            Builds the migration plan
+  planfile.py           Full-fidelity plan save/load (executable plan files)
   executor.py           Creates objects/rules in FMC
   auditor.py            Policy comparison logic
   reporter.py           Unified error/warning/statistics reporting
+tests/                  pytest suite (parser, classifier, plan round-trip)
+```
+
+## Running tests
+
+```bash
+pip install pytest
+python -m pytest tests/
 ```
 
 ## Known quirks
 
-- No automated tests. The parser is safe to run repeatedly, but treat any FMC-facing change with a dry run first.
+- Rules that were scoped by WatchGuard interface aliases (`Any-Trusted`, `Any-External`, BOVPN/SSLVPN constructs) lose that scoping in FMC — empty source/destination means "any," which is broader than the original. Review these (the audit flags them) until interface-to-zone mapping lands.
+- Executing the same plan twice is safe for objects (already-exists is tolerated) but will duplicate rules in the ACP.

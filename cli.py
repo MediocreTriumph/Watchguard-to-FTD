@@ -25,6 +25,7 @@ from analysis.service_mapper import ServiceMapper
 from analysis.app_mapper import ApplicationMapper
 from migration.planner import MigrationPlanner
 from migration.executor import MigrationExecutor
+from migration import planfile
 
 
 def main():
@@ -79,11 +80,19 @@ Application Mappings File Format (JSON):
     )
     
     # Required arguments
-    parser.add_argument('config_file', help='Path to parsed WatchGuard JSON config')
+    parser.add_argument('config_file', nargs='?', default=None,
+                       help='Path to parsed WatchGuard JSON config '
+                            '(omit when using --from-plan)')
+
+    # Plan file execution (v9)
+    parser.add_argument('--from-plan', default=None, metavar='PLAN_FILE',
+                       help='Execute from a previously saved migration_plan.json '
+                            'instead of re-planning. The plan file may be '
+                            'hand-edited (e.g. remove rules) before execution.')
     
-    # FMC connection
-    parser.add_argument('--fmc-host', required=True, help='FMC hostname or IP')
-    parser.add_argument('--fmc-user', required=True, help='FMC username')
+    # FMC connection (not required for --from-plan validation without --execute)
+    parser.add_argument('--fmc-host', default=None, help='FMC hostname or IP')
+    parser.add_argument('--fmc-user', default=None, help='FMC username')
     parser.add_argument('--fmc-pass', default=None,
                        help='FMC password (prefer FMC_PASSWORD env var or '
                             'interactive prompt; passing on the command line '
@@ -100,6 +109,11 @@ Application Mappings File Format (JSON):
     parser.add_argument('--execute', action='store_true',
                        help='Execute migration (default is dry-run: build plan '
                             'but don\'t create objects)')
+    parser.add_argument('--include-management', action='store_true',
+                       help='Also migrate management-plane and default-deny '
+                            'policies (WatchGuard Web UI, Ping To Firebox, '
+                            'Unhandled Packet rules, etc.). Skipped by default '
+                            'because FTD handles these outside the ACP.')
 
     # Zone mapping options (v6)
     parser.add_argument('--enable-zones', action='store_true',
@@ -123,6 +137,20 @@ Application Mappings File Format (JSON):
     
     args = parser.parse_args()
 
+    # Validate input source: parsed config XOR plan file
+    if not args.from_plan and not args.config_file:
+        parser.error('config_file is required (or use --from-plan PLAN_FILE)')
+    if args.from_plan and args.config_file:
+        parser.error('give either config_file or --from-plan, not both')
+
+    # Plan-file validation mode needs no FMC connection at all
+    if args.from_plan and not args.execute:
+        sys.exit(0 if validate_plan_file(args.from_plan) else 1)
+
+    # Every other mode talks to FMC
+    if not args.fmc_host or not args.fmc_user:
+        parser.error('--fmc-host and --fmc-user are required')
+
     # Resolve password: --fmc-pass > FMC_PASSWORD env var > interactive prompt
     fmc_password = args.fmc_pass or os.environ.get('FMC_PASSWORD')
     if not fmc_password:
@@ -134,7 +162,7 @@ Application Mappings File Format (JSON):
 
     # Build configuration
     config = MigrationConfig(
-        watchguard_config_file=args.config_file,
+        watchguard_config_file=args.config_file or args.from_plan,
         fmc_host=args.fmc_host,
         fmc_username=args.fmc_user,
         fmc_password=fmc_password,
@@ -146,16 +174,27 @@ Application Mappings File Format (JSON):
     
     # Run migration
     try:
-        success = run_migration(
-            config,
-            enable_zones=args.enable_zones,
-            use_existing_acp=use_existing_acp,
-            enable_users=args.enable_users,
-            user_confidence=args.user_confidence,
-            app_mappings_file=args.app_mappings,
-            zone_inside=args.zone_inside,
-            zone_outside=args.zone_outside
-        )
+        if args.from_plan:
+            success = run_from_plan(
+                config,
+                plan_file=args.from_plan,
+                use_existing_acp=use_existing_acp,
+                enable_zones=args.enable_zones,
+                zone_inside=args.zone_inside,
+                zone_outside=args.zone_outside
+            )
+        else:
+            success = run_migration(
+                config,
+                enable_zones=args.enable_zones,
+                use_existing_acp=use_existing_acp,
+                enable_users=args.enable_users,
+                user_confidence=args.user_confidence,
+                app_mappings_file=args.app_mappings,
+                zone_inside=args.zone_inside,
+                zone_outside=args.zone_outside,
+                include_management=args.include_management
+            )
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Migration failed: {e}")
@@ -164,10 +203,99 @@ Application Mappings File Format (JSON):
         sys.exit(1)
 
 
+def validate_plan_file(plan_file: str) -> bool:
+    """Load and summarize a plan file without touching FMC."""
+    print("="*60)
+    print("VALIDATING PLAN FILE")
+    print("="*60)
+    try:
+        plan = planfile.load_plan(plan_file)
+    except (ValueError, KeyError, TypeError, OSError) as e:
+        print(f"\n✗ Plan file invalid: {e}")
+        return False
+
+    print(f"\n✓ Plan file is valid: {plan_file}")
+    print(f"  Objects to create:  {len(plan.objects_to_create)}")
+    print(f"  Service groups:     {len(plan.service_groups_to_create)}")
+    print(f"  Policies to create: {len(plan.policies_to_create)}")
+    skipped = [s for s in plan.skipped_policies if not s.get('included')]
+    if skipped:
+        print(f"  Policies skipped at planning time: {len(skipped)}")
+    if plan.errors:
+        print(f"  ⚠ Plan contains {len(plan.errors)} errors - review before executing")
+    print("\nRun with --execute to apply this plan to FMC.")
+    return True
+
+
+def _connect_fmc(config: MigrationConfig):
+    """Connect and authenticate to FMC. Returns client or None."""
+    fmc_client = FMCClient(
+        config.fmc_host,
+        config.fmc_username,
+        config.fmc_password,
+        config.verify_ssl
+    )
+    if not fmc_client.authenticate():
+        print("\n✗ Failed to authenticate with FMC")
+        return None
+    print(f"\n✓ Connected to FMC")
+    print(f"  Domain UUID: {fmc_client.domain_uuid}")
+    return fmc_client
+
+
+def run_from_plan(config: MigrationConfig, plan_file: str,
+                  use_existing_acp: bool = False, enable_zones: bool = False,
+                  zone_inside: str = 'INSIDE', zone_outside: str = 'OUTSIDE') -> bool:
+    """Execute a previously saved (and possibly hand-edited) plan file."""
+    print("="*60)
+    print("WATCHGUARD TO CISCO FTD MIGRATION TOOL - EXECUTE FROM PLAN")
+    print("="*60)
+    print(f"\nPlan file: {plan_file}")
+    print(f"Target: {config.fmc_host}")
+
+    plan = planfile.load_plan(plan_file)
+    print(f"\n✓ Loaded plan")
+    print(f"  Objects to create:  {len(plan.objects_to_create)}")
+    print(f"  Policies to create: {len(plan.policies_to_create)}")
+
+    fmc_client = _connect_fmc(config)
+    if not fmc_client:
+        return False
+
+    discovery = FMCDiscovery(fmc_client)
+    fmc_objects = discovery.discover_all()
+
+    # Optional zone mapping: rebuild object values from the plan itself
+    zone_mapper = None
+    if enable_zones:
+        zone_mapper = ZoneMapper(fmc_client, inside_zone=zone_inside,
+                                 outside_zone=zone_outside)
+        if not zone_mapper.discover_fmc_zones():
+            print(f"  ⚠ Expected zones ({zone_inside}/{zone_outside}) not found - zone mapping disabled")
+            zone_mapper = None
+        else:
+            addresses = [e['wg_object'] for e in plan.objects_to_create
+                         if hasattr(e['wg_object'], 'object_type')]
+
+            class _PlanAddresses:
+                hosts = addresses
+                networks = addresses
+                ranges = addresses
+
+            zone_mapper.load_wg_object_values(_PlanAddresses())
+            zone_mapper.print_summary()
+
+    print("\n⚠  This will create objects in FMC")
+    executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
+                                 zone_mapper=zone_mapper, user_mapper=None)
+    return executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
+
+
 def run_migration(config: MigrationConfig, enable_zones: bool = False,
                   use_existing_acp: bool = False, enable_users: bool = False,
                   user_confidence: float = 0.85, app_mappings_file: str = None,
-                  zone_inside: str = 'INSIDE', zone_outside: str = 'OUTSIDE') -> bool:
+                  zone_inside: str = 'INSIDE', zone_outside: str = 'OUTSIDE',
+                  include_management: bool = False) -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -345,7 +473,8 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("="*60)
     
     planner = MigrationPlanner(wg_config, fmc_objects, service_mapper, app_mapper,
-                               user_mapper=user_mapper)
+                               user_mapper=user_mapper,
+                               include_management=include_management)
     plan = planner.build_plan()
     
     # Step 8: Save plan to file
@@ -354,8 +483,31 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("="*60)
     
     plan_file = "migration_plan.json"
-    save_migration_plan(plan, plan_file, zone_mapper, user_mapper, app_mapper)
+    extra_reports = {}
+    if zone_mapper:
+        extra_reports['zone_mapping'] = zone_mapper.get_report()
+    if user_mapper:
+        extra_reports['user_mapping'] = user_mapper.get_report()
+    if app_mapper and hasattr(app_mapper, 'get_report'):
+        extra_reports['application_mapping'] = app_mapper.get_report()
+
+    planfile.save_plan(
+        plan, plan_file,
+        metadata={
+            'source_config': config.watchguard_config_file,
+            'fmc_host': config.fmc_host,
+            'acp_name': config.new_acp_name,
+            'use_existing_acp': use_existing_acp,
+            'include_management': include_management,
+        },
+        extra_reports=extra_reports or None
+    )
     print(f"\n✓ Migration plan saved to: {plan_file}")
+
+    skipped = [s for s in plan.skipped_policies if not s.get('included')]
+    if skipped:
+        print(f"  Policies skipped by classification: {len(skipped)} "
+              f"(rerun with --include-management to migrate them)")
     
     # Show application mapping summary
     policies_with_apps = plan.statistics.get('policies_with_applications', 0)
@@ -372,68 +524,25 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
         print("DRY RUN COMPLETE")
         print("="*60)
         print("\nNo objects were created in FMC.")
-        print("Review the migration plan and run with --execute to proceed.")
+        print("Review (and optionally edit) the migration plan, then either")
+        print("re-run with --execute, or run: cli.py --from-plan migration_plan.json --execute")
         return True
-    
+
     # Step 9: Execute migration
     print("\n" + "="*60)
     print("STEP 9: EXECUTING MIGRATION")
     print("="*60)
     print("\n⚠  This will create objects in FMC")
-    
-    # Pass fmc_objects, zone_mapper, and user_mapper to executor
+
+    # Execute from the saved plan file (round-trip) so the file on disk is
+    # always a faithful, executable record of what was migrated.
+    plan = planfile.load_plan(plan_file)
+
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
                                   zone_mapper=zone_mapper, user_mapper=user_mapper)
     success = executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
-    
+
     return success
-
-
-def save_migration_plan(plan, filename: str, zone_mapper=None, user_mapper=None, app_mapper=None):
-    """Save migration plan to JSON file."""
-    # Convert plan to serializable format
-    plan_data = {
-        'statistics': {
-            'total_wg_objects': plan.total_wg_objects,
-            'mapped_to_existing': plan.mapped_to_existing,
-            'needs_creation': plan.needs_creation,
-            'unmapped': plan.unmapped,
-            'policies_with_applications': plan.statistics.get('policies_with_applications', 0),
-            'policies_with_users': plan.statistics.get('policies_with_users', 0)
-        },
-        'address_mappings': {
-            name: {'id': obj.id, 'name': obj.name, 'type': obj.type}
-            for name, obj in plan.address_mappings.items()
-        },
-        'service_mappings': {
-            name: {'id': obj.id, 'name': obj.name, 'type': obj.type, 
-                   'protocol': obj.protocol, 'port': obj.port}
-            for name, obj in plan.service_mappings.items()
-        },
-        'app_mappings': {
-            name: {'id': obj.id, 'name': obj.name, 'type': obj.type}
-            for name, obj in plan.app_mappings.items()
-        },
-        'objects_to_create': len(plan.objects_to_create),
-        'policies_to_create': len(plan.policies_to_create),
-        'warnings': plan.warnings,
-        'errors': plan.errors
-    }
-    
-    # Add zone mapping data if available (v6)
-    if zone_mapper:
-        plan_data['zone_mapping'] = zone_mapper.get_report()
-    
-    # Add user mapping data if available (v7)
-    if user_mapper:
-        plan_data['user_mapping'] = user_mapper.get_report()
-    
-    # Add application mapping report if available (v8)
-    if app_mapper and hasattr(app_mapper, 'get_report'):
-        plan_data['application_mapping'] = app_mapper.get_report()
-    
-    with open(filename, 'w') as f:
-        json.dump(plan_data, f, indent=2)
 
 
 if __name__ == '__main__':

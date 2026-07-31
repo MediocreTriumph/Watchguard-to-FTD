@@ -9,10 +9,11 @@ from typing import Dict, List, Set, Any, Optional, Tuple
 from dataclasses import dataclass, field
 import json
 from models import (
-    WatchGuardConfig, WatchGuardPolicy, WatchGuardAddress, 
+    WatchGuardConfig, WatchGuardPolicy, WatchGuardAddress,
     WatchGuardAddressGroup, WatchGuardService, WatchGuardServiceGroup,
     WatchGuardAppAction, FMCObject
 )
+from .classifier import split_policies, classify_policy
 
 
 @dataclass  
@@ -27,6 +28,9 @@ class MigrationPlan:
     
     # Service group support (v5)
     service_groups_to_create: List[WatchGuardServiceGroup] = field(default_factory=list)
+
+    # Policy classification (v9): policies excluded from migration, with reasons
+    skipped_policies: List[Dict] = field(default_factory=list)
     
     @property
     def total_wg_objects(self):
@@ -87,13 +91,15 @@ class MigrationPlan:
 class MigrationPlanner:
     """Plans migration from WatchGuard to FMC with proper alias resolution."""
     
-    def __init__(self, wg_config: WatchGuardConfig, fmc_discovery, 
-                 service_mapper, app_mapper, user_mapper=None):
+    def __init__(self, wg_config: WatchGuardConfig, fmc_discovery,
+                 service_mapper, app_mapper, user_mapper=None,
+                 include_management: bool = False):
         self.wg_config = wg_config
         self.fmc_discovery = fmc_discovery
         self.service_mapper = service_mapper
         self.app_mapper = app_mapper
         self.user_mapper = user_mapper  # v7: optional user mapper
+        self.include_management = include_management  # v9: classification override
         self._build_lookups()
     
     def _is_host_mask(self, mask: str) -> bool:
@@ -392,16 +398,32 @@ class MigrationPlanner:
         for group in self.wg_config.address_groups:
             objects_to_create.append({'type': 'address_group', 'wg_object': group})
         
+        print("\nClassifying policies...")
+        policies_to_migrate, skipped_policies = split_policies(
+            self.wg_config.policies, include_management=self.include_management
+        )
+        skipped_count = sum(1 for s in skipped_policies if not s.get('included'))
+        included_nontraffic = sum(1 for s in skipped_policies if s.get('included'))
+        print(f"  Traffic policies: {len(policies_to_migrate) - included_nontraffic}")
+        if skipped_count:
+            print(f"  Skipped (management-plane/default-deny): {skipped_count}")
+            for s in skipped_policies:
+                if not s.get('included'):
+                    print(f"    - [{s['classification']}] {s['name']}: {s['reason']}")
+        if included_nontraffic:
+            print(f"  Non-traffic policies INCLUDED via --include-management: {included_nontraffic}")
+
         print("\nPlanning policy migration...")
         policies_with_issues = 0
         policies_with_warnings = 0
         policies_with_apps = 0
         policies_with_service_groups = 0
         policies_with_users = 0
-        
-        for policy in self.wg_config.policies:
-            policy_plan, issues = self._plan_policy(policy, address_mappings, 
+
+        for policy in policies_to_migrate:
+            policy_plan, issues = self._plan_policy(policy, address_mappings,
                                                     service_mappings, application_mappings)
+            policy_plan['classification'] = classify_policy(policy)
             if issues:
                 policies_with_issues += 1
             if policy_plan.get('warnings'):
@@ -414,7 +436,7 @@ class MigrationPlanner:
                 policies_with_users += 1
             policies_to_create.append(policy_plan)
         
-        print(f"  Total policies: {len(self.wg_config.policies)}")
+        print(f"  Total policies: {len(policies_to_migrate)} of {len(self.wg_config.policies)} (after classification)")
         print(f"  With issues: {policies_with_issues}")
         print(f"  With applications: {policies_with_apps}")
         print(f"  With service groups: {policies_with_service_groups}")
@@ -426,7 +448,8 @@ class MigrationPlanner:
             'mapped_to_existing': len(address_mappings),
             'needs_creation': len(objects_to_create),
             'unmapped': 0,
-            'total_policies': len(self.wg_config.policies),
+            'total_policies': len(policies_to_migrate),
+            'policies_skipped': sum(1 for s in skipped_policies if not s.get('included')),
             'policies_with_issues': policies_with_issues,
             'policies_with_warnings': policies_with_warnings,
             'policies_with_errors': policies_with_issues,
@@ -443,7 +466,8 @@ class MigrationPlanner:
             objects_to_create=objects_to_create,
             policies_to_create=policies_to_create,
             statistics=statistics,
-            service_groups_to_create=service_groups_to_create
+            service_groups_to_create=service_groups_to_create,
+            skipped_policies=skipped_policies
         )
     
     def _plan_policy(self, policy: WatchGuardPolicy, address_mappings: Dict,
