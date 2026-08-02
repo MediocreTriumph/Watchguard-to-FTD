@@ -312,18 +312,25 @@ class ZoneMapper:
         return None
     
     def is_interface_reference(self, name: str) -> bool:
-        """Check if a name refers to an interface (vs a network object)."""
+        """Check if a name refers to an interface (vs a network object).
+
+        NOTE: only meaningful for names that failed object lookup. Bare
+        'vpn'/'tunnel' substrings are deliberately NOT matched - WatchGuard
+        auto-generates real address objects with names like
+        'Allow Servers to SSL VPN.1.from.1.pcy', and matching on 'vpn'
+        silently stripped them from rules.
+        """
         interface_patterns = [
-            "Any-BOVPN", "Any-MUVPN", "Any-External", "Any-Trusted", 
+            "Any-BOVPN", "Any-MUVPN", "Any-External", "Any-Trusted",
             "Any-Optional", "Any-Multicast", "Any", "Firebox"
         ]
         if name in interface_patterns:
             return True
-        
+
         name_lower = name.lower()
-        if any(p in name_lower for p in ["bovpn", "muvpn", "vpn", "tunnel"]):
+        if any(p in name_lower for p in ["bovpn", "muvpn"]):
             return True
-        
+
         return False
     
     def get_report(self) -> Dict[str, Any]:

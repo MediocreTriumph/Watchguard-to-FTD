@@ -134,23 +134,31 @@ class MigrationExecutor:
         return "already exists" in error_text.lower()
     
     def _is_interface_reference(self, name: str) -> bool:
-        """Check if a name refers to an interface rather than a network object."""
+        """Check if a name refers to an interface rather than a network object.
+
+        NOTE: only call this for names that failed object lookup. A name that
+        resolves to a real object is never an interface reference, no matter
+        what it's called (e.g. WatchGuard auto-generates per-policy address
+        objects like 'Allow Servers to SSL VPN.1.from.1.pcy').
+        """
         if self.zone_mapper:
             return self.zone_mapper.is_interface_reference(name)
-        
+
         # Fallback patterns when zone_mapper not available
         interface_patterns = [
-            "Any-BOVPN", "Any-MUVPN", "Any-External", "Any-Trusted", 
-            "Any-Optional", "Any-Multicast", "Any"
+            "Any-BOVPN", "Any-MUVPN", "Any-External", "Any-Trusted",
+            "Any-Optional", "Any-Multicast", "Any", "Firebox"
         ]
         if name in interface_patterns:
             return True
-        
-        # Check for common interface-like patterns
+
+        # WatchGuard-specific VPN interface terms only. Deliberately NOT
+        # matching bare 'vpn'/'tunnel' - those appear in legitimate object
+        # names and silently dropping them breaks rules.
         name_lower = name.lower()
-        if any(p in name_lower for p in ["bovpn", "muvpn", "vpn", "tunnel"]):
+        if any(p in name_lower for p in ["bovpn", "muvpn"]):
             return True
-        
+
         return False
     
     def _lookup_object(self, name: str) -> Optional[FMCObject]:
@@ -934,11 +942,7 @@ class MigrationExecutor:
         skipped_interfaces = []
         
         for member_name in wg_group.members:
-            # Check if this is an interface reference (v6)
-            if self._is_interface_reference(member_name):
-                skipped_interfaces.append(member_name)
-                continue
-            
+            # Lookup first - only treat unresolvable names as interface refs (v9)
             obj = self._lookup_object(member_name)
             if obj:
                 if obj.type == 'Url':
@@ -948,6 +952,8 @@ class MigrationExecutor:
                     'id': obj.id,
                     'name': obj.name
                 })
+            elif self._is_interface_reference(member_name):
+                skipped_interfaces.append(member_name)
         
         if not objects:
             return None, skipped_interfaces
@@ -1042,9 +1048,8 @@ class MigrationExecutor:
             for obj_ref in resolved_rule['sourceNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
-                    if self._is_interface_reference(obj_name):
-                        continue
-                    
+                    # Lookup FIRST: a resolvable object is a real object,
+                    # regardless of what its name looks like.
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
                         obj_entry = {
@@ -1056,6 +1061,10 @@ class MigrationExecutor:
                             resolved_source_urls.append(obj_entry)
                         else:
                             resolved_sources.append(obj_entry)
+                    elif self._is_interface_reference(obj_name):
+                        # Unresolvable AND matches interface alias patterns:
+                        # expected drop (zones handle these), skip silently.
+                        continue
                     else:
                         warnings.append({
                             'type': 'unresolved',
@@ -1090,9 +1099,7 @@ class MigrationExecutor:
             for obj_ref in resolved_rule['destinationNetworks'].get('objects', []):
                 obj_name = obj_ref.get('name')
                 if obj_name:
-                    if self._is_interface_reference(obj_name):
-                        continue
-                    
+                    # Lookup FIRST (see source resolution above)
                     fmc_obj = self._lookup_object(obj_name)
                     if fmc_obj:
                         obj_entry = {
@@ -1104,6 +1111,8 @@ class MigrationExecutor:
                             resolved_dest_urls.append(obj_entry)
                         else:
                             resolved_dests.append(obj_entry)
+                    elif self._is_interface_reference(obj_name):
+                        continue
                     else:
                         warnings.append({
                             'type': 'unresolved',
