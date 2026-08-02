@@ -3,8 +3,9 @@ __pycache__/
 .DS_Store
 
 # Generated outputs
-migration_plan.json
+migration_plan*.json
 migration_report.json
-policy_audit_report.json
+policy_audit_report*.json
 watchguard_config_v5_*.json
 watchguard_config_v5_*.xlsx
+*_WG_Config.json
