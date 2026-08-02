@@ -27,13 +27,14 @@ FMC_MAX_OBJECTS_PER_RULE = 200
 class MigrationExecutor:
     """Executes migration plan by creating objects in FMC."""
     
-    def __init__(self, fmc_client: FMCClient, plan, fmc_discovery=None, 
-                 zone_mapper=None, user_mapper=None):
+    def __init__(self, fmc_client: FMCClient, plan, fmc_discovery=None,
+                 zone_mapper=None, user_mapper=None, zone_resolver=None):
         self.fmc = fmc_client
         self.plan = plan
         self.fmc_discovery = fmc_discovery
         self.zone_mapper = zone_mapper
         self.user_mapper = user_mapper  # v7: optional user mapper
+        self.zone_resolver = zone_resolver  # v10: explicit zone name resolution
         self.created_objects: Dict[str, FMCObject] = {}
         self.execution_log: List[str] = []
         self.errors: List[str] = []
@@ -1228,30 +1229,60 @@ class MigrationExecutor:
                 'user': user_name
             })
         
-        # Zone inference (v6.3)
-        if self.zone_mapper:
+        # Explicit zones from the plan (v10) - take precedence over inference
+        explicit_src_zones = policy_data.get('source_zones') or []
+        explicit_dst_zones = policy_data.get('destination_zones') or []
+        applied_explicit = False
+
+        if (explicit_src_zones or explicit_dst_zones) and self.zone_resolver:
+            src_refs = self.zone_resolver.resolve_all(explicit_src_zones)
+            dst_refs = self.zone_resolver.resolve_all(explicit_dst_zones)
+
+            if src_refs:
+                resolved_rule['sourceZones'] = {'objects': src_refs}
+            if dst_refs:
+                resolved_rule['destinationZones'] = {'objects': dst_refs}
+            if src_refs or dst_refs:
+                self.rules_with_zones += 1
+                applied_explicit = True
+
+            for missing in (set(explicit_src_zones) - {r['name'] for r in src_refs}) | \
+                           (set(explicit_dst_zones) - {r['name'] for r in dst_refs}):
+                warnings.append({
+                    'type': 'zone_mapping',
+                    'message': f"Zone '{missing}' not found in FMC - create it and re-run, "
+                               f"or fix the name in the zone mappings file"
+                })
+        elif (explicit_src_zones or explicit_dst_zones) and not self.zone_resolver:
+            warnings.append({
+                'type': 'zone_mapping',
+                'message': 'Plan specifies zones but no zone resolver available'
+            })
+
+        # Zone inference (v6.3) - fallback for rules without explicit zones
+        if not applied_explicit and self.zone_mapper:
             resolved_sources = resolved_rule.get('sourceNetworks', {}).get('objects', [])
             resolved_dests = resolved_rule.get('destinationNetworks', {}).get('objects', [])
-            
+
             source_zone, dest_zone, zone_warnings = self._resolve_zones_for_rule(
                 resolved_sources, resolved_dests, rule_name
             )
-            
+
             if source_zone:
                 resolved_rule['sourceZones'] = {'objects': [source_zone]}
                 self.rules_with_zones += 1
-            
+
             if dest_zone:
                 resolved_rule['destinationZones'] = {'objects': [dest_zone]}
                 if not source_zone:
                     self.rules_with_zones += 1
-            
+
             for zw in zone_warnings:
                 warnings.append({
                     'type': 'zone_mapping',
                     'message': zw
                 })
-        
+
         return resolved_rule, warnings
     
     def _create_access_rules(self, acp_id: str) -> bool:

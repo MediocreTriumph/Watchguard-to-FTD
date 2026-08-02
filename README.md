@@ -87,9 +87,11 @@ python cli.py <parsed>.json --fmc-host <ip> --fmc-user admin \
 
 | Flag | Purpose |
 |---|---|
-| `--enable-zones` | Map WatchGuard interfaces to FMC security zones. The zones must already exist in FMC; mapping is disabled with a warning otherwise. |
-| `--zone-inside <name>` | FMC zone for internal/RFC1918 networks (default `INSIDE`). |
-| `--zone-outside <name>` | FMC zone for external/public networks (default `OUTSIDE`). |
+| `--zone-mappings <file>` | Explicit WatchGuard alias → FMC zone mapping (see Zone mapping below). The right way to restore interface-based rule scoping. |
+| `--generate-zone-template` | Write `zone_mappings_template.json` from the parsed config and exit. Offline; no FMC needed. |
+| `--enable-zones` | IP-heuristic zone inference (RFC1918 → inside). Fallback for rules without explicit mappings. |
+| `--zone-inside <name>` | Inference: FMC zone for internal/RFC1918 networks (default `INSIDE`). |
+| `--zone-outside <name>` | Inference: FMC zone for external/public networks (default `OUTSIDE`). |
 | `--fmc-pass <pw>` | FMC password. Prefer `FMC_PASSWORD` env var or the interactive prompt. |
 | `--include-management` | Also migrate management-plane and default-deny policies (skipped by default). |
 | `--from-plan <file>` | Execute a saved (optionally hand-edited) plan file instead of re-planning. Without `--execute`, validates the file offline. |
@@ -109,6 +111,26 @@ Manual app mappings format:
   }
 }
 ```
+
+## Zone mapping
+
+WatchGuard scopes rules with interface aliases (`Any-Trusted`, `Any-External`, VPN aliases). Those resolve to no address objects, so without zone mapping the migrated rules are broader than the originals (empty = any in FMC). Explicit alias→zone mapping restores that scoping:
+
+```bash
+# 1. Generate the worksheet (offline)
+python cli.py <parsed>.json --generate-zone-template
+
+# 2. Fill in FMC zone names, rename to zone_mappings.json
+#    {"mappings": {"Any-Trusted": "INSIDE", "Any-External": "OUTSIDE",
+#                  "SSLVPN-Users": "RAVPN", "Firebox": "", "Any": ""}}
+
+# 3. Create the zones in FMC (Objects > Interface > Security Zone),
+#    then plan with the mappings
+python cli.py <parsed>.json --zone-mappings zone_mappings.json \
+    --fmc-host <ip> --fmc-user admin --no-verify-ssl
+```
+
+Zone *names* are stored in the plan file; they're resolved to FMC SecurityZone objects at execution time, and execution warns up front about zones the FMC doesn't have. Empty string means "leave that side unconstrained" — right for `Any` and for the `Firebox` alias (management-plane policies are skipped anyway). Rules with explicit zones skip the IP-inference fallback.
 
 ## Step 4: Audit
 
@@ -147,7 +169,8 @@ fmc/
   client.py             FMC REST client (auth, token refresh, pagination)
   discovery.py          Discovers existing FMC objects
   canonical.py          Canonical port mapping (prefers FMC built-ins)
-  zones.py              Interface → zone mapping
+  zones.py              IP-heuristic zone inference (fallback)
+  zone_mapping.py       Explicit alias → zone mapping + template generator
   user_mapper.py        WG aliases → FMC realm users
 migration/
   classifier.py         Tags policies traffic/management-plane/default-deny
@@ -168,5 +191,5 @@ python -m pytest tests/
 
 ## Known quirks
 
-- Rules that were scoped by WatchGuard interface aliases (`Any-Trusted`, `Any-External`, BOVPN/SSLVPN constructs) lose that scoping in FMC — empty source/destination means "any," which is broader than the original. Review these (the audit flags them) until interface-to-zone mapping lands.
+- Without `--zone-mappings`, rules scoped by WatchGuard interface aliases lose that scoping in FMC (empty = any, broader than the original). Use zone mapping; the planner warns on any alias that has neither a zone mapping nor address members.
 - Executing the same plan twice is safe for objects (already-exists is tolerated) but will duplicate rules in the ACP.

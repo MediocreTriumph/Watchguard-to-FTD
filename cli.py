@@ -21,6 +21,7 @@ from fmc.discovery import FMCDiscovery
 from fmc.canonical import CanonicalPortMapper
 from fmc.zones import ZoneMapper
 from fmc.user_mapper import UserMapper
+from fmc.zone_mapping import AliasZoneMapper, ZoneNameResolver
 from analysis.service_mapper import ServiceMapper
 from analysis.app_mapper import ApplicationMapper
 from migration.planner import MigrationPlanner
@@ -115,9 +116,19 @@ Application Mappings File Format (JSON):
                             'Unhandled Packet rules, etc.). Skipped by default '
                             'because FTD handles these outside the ACP.')
 
-    # Zone mapping options (v6)
+    # Zone mapping options (v6 inference, v10 explicit)
+    parser.add_argument('--zone-mappings', default=None, metavar='FILE',
+                       help='JSON file mapping WatchGuard interface aliases to FMC '
+                            'security zone names. Restores interface-based rule '
+                            'scoping. Generate a starting point with '
+                            '--generate-zone-template.')
+    parser.add_argument('--generate-zone-template', action='store_true',
+                       help='Write zone_mappings_template.json listing every alias '
+                            'in the config that needs a zone decision, then exit '
+                            '(no FMC connection required)')
     parser.add_argument('--enable-zones', action='store_true',
-                       help='Enable interface-to-zone mapping (zones must exist in FMC)')
+                       help='Enable IP-heuristic zone inference (RFC1918=inside). '
+                            'Used as fallback for rules without explicit mappings.')
     parser.add_argument('--zone-inside', default='INSIDE',
                        help='Name of FMC security zone for internal networks (default: INSIDE)')
     parser.add_argument('--zone-outside', default='OUTSIDE',
@@ -142,6 +153,20 @@ Application Mappings File Format (JSON):
         parser.error('config_file is required (or use --from-plan PLAN_FILE)')
     if args.from_plan and args.config_file:
         parser.error('give either config_file or --from-plan, not both')
+
+    # Offline: generate zone mappings template from the parsed config
+    if args.generate_zone_template:
+        if not args.config_file:
+            parser.error('--generate-zone-template requires config_file')
+        from fmc.zone_mapping import write_zone_template
+        with open(args.config_file, 'r') as f:
+            wg_data = json.load(f)
+        out = 'zone_mappings_template.json'
+        count = write_zone_template(wg_data, out)
+        print(f"✓ Wrote {out} with {count} aliases to map")
+        print("  Fill in FMC zone names (empty string = no zone), rename the file,")
+        print("  and pass it with --zone-mappings")
+        sys.exit(0)
 
     # Plan-file validation mode needs no FMC connection at all
     if args.from_plan and not args.execute:
@@ -193,7 +218,8 @@ Application Mappings File Format (JSON):
                 app_mappings_file=args.app_mappings,
                 zone_inside=args.zone_inside,
                 zone_outside=args.zone_outside,
-                include_management=args.include_management
+                include_management=args.include_management,
+                zone_mappings_file=args.zone_mappings
             )
         sys.exit(0 if success else 1)
     except Exception as e:
@@ -285,9 +311,12 @@ def run_from_plan(config: MigrationConfig, plan_file: str,
             zone_mapper.load_wg_object_values(_PlanAddresses())
             zone_mapper.print_summary()
 
+    zone_resolver = _build_zone_resolver_if_needed(fmc_client, plan)
+
     print("\n⚠  This will create objects in FMC")
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
-                                 zone_mapper=zone_mapper, user_mapper=None)
+                                 zone_mapper=zone_mapper, user_mapper=None,
+                                 zone_resolver=zone_resolver)
     return executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
 
 
@@ -295,7 +324,8 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
                   use_existing_acp: bool = False, enable_users: bool = False,
                   user_confidence: float = 0.85, app_mappings_file: str = None,
                   zone_inside: str = 'INSIDE', zone_outside: str = 'OUTSIDE',
-                  include_management: bool = False) -> bool:
+                  include_management: bool = False,
+                  zone_mappings_file: str = None) -> bool:
     """Run the migration process."""
     
     print("="*60)
@@ -472,9 +502,17 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     print("STEP 7: BUILDING MIGRATION PLAN")
     print("="*60)
     
+    # Load explicit alias->zone mappings (v10)
+    alias_zone_mapper = None
+    if zone_mappings_file:
+        alias_zone_mapper = AliasZoneMapper(zone_mappings_file)
+        print(f"\n  Loaded {len(alias_zone_mapper.mappings)} alias->zone mappings "
+              f"from {zone_mappings_file}")
+
     planner = MigrationPlanner(wg_config, fmc_objects, service_mapper, app_mapper,
                                user_mapper=user_mapper,
-                               include_management=include_management)
+                               include_management=include_management,
+                               alias_zone_mapper=alias_zone_mapper)
     plan = planner.build_plan()
     
     # Step 8: Save plan to file
@@ -538,11 +576,35 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     # always a faithful, executable record of what was migrated.
     plan = planfile.load_plan(plan_file)
 
+    zone_resolver = _build_zone_resolver_if_needed(fmc_client, plan)
+
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
-                                  zone_mapper=zone_mapper, user_mapper=user_mapper)
+                                  zone_mapper=zone_mapper, user_mapper=user_mapper,
+                                  zone_resolver=zone_resolver)
     success = executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
 
     return success
+
+
+def _build_zone_resolver_if_needed(fmc_client, plan):
+    """Create and prime a ZoneNameResolver if any rule in the plan carries
+    explicit zone names. Warns up front about zones missing from FMC."""
+    zone_names = set()
+    for p in plan.policies_to_create:
+        zone_names.update(p.get('source_zones') or [])
+        zone_names.update(p.get('destination_zones') or [])
+    if not zone_names:
+        return None
+
+    resolver = ZoneNameResolver(fmc_client)
+    found = resolver.discover()
+    print(f"\n  Plan uses zones: {', '.join(sorted(zone_names))}")
+    print(f"  Security zones in FMC: {found}")
+    missing = [z for z in sorted(zone_names) if resolver.resolve(z) is None]
+    if missing:
+        print(f"  ⚠ Zones missing from FMC (create them or rules lose scoping): "
+              f"{', '.join(missing)}")
+    return resolver
 
 
 if __name__ == '__main__':

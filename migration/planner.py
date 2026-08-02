@@ -93,13 +93,15 @@ class MigrationPlanner:
     
     def __init__(self, wg_config: WatchGuardConfig, fmc_discovery,
                  service_mapper, app_mapper, user_mapper=None,
-                 include_management: bool = False):
+                 include_management: bool = False,
+                 alias_zone_mapper=None):
         self.wg_config = wg_config
         self.fmc_discovery = fmc_discovery
         self.service_mapper = service_mapper
         self.app_mapper = app_mapper
         self.user_mapper = user_mapper  # v7: optional user mapper
         self.include_management = include_management  # v9: classification override
+        self.alias_zone_mapper = alias_zone_mapper  # v10: explicit alias->zone
         self._build_lookups()
     
     def _is_host_mask(self, mask: str) -> bool:
@@ -419,11 +421,14 @@ class MigrationPlanner:
         policies_with_apps = 0
         policies_with_service_groups = 0
         policies_with_users = 0
+        policies_with_zones = 0
 
         for policy in policies_to_migrate:
             policy_plan, issues = self._plan_policy(policy, address_mappings,
                                                     service_mappings, application_mappings)
             policy_plan['classification'] = classify_policy(policy)
+            if policy_plan.get('source_zones') or policy_plan.get('destination_zones'):
+                policies_with_zones += 1
             if issues:
                 policies_with_issues += 1
             if policy_plan.get('warnings'):
@@ -442,6 +447,8 @@ class MigrationPlanner:
         print(f"  With service groups: {policies_with_service_groups}")
         if policies_with_users > 0:
             print(f"  With users: {policies_with_users}")
+        if policies_with_zones > 0:
+            print(f"  With explicit zones: {policies_with_zones}")
         
         statistics = {
             'total_wg_objects': len(self.address_objects),
@@ -456,6 +463,7 @@ class MigrationPlanner:
             'policies_with_applications': policies_with_apps,
             'policies_with_service_groups': policies_with_service_groups,
             'policies_with_users': policies_with_users,
+            'policies_with_zones': policies_with_zones,
             'service_groups_to_create': len(service_groups_to_create)
         }
         
@@ -717,6 +725,29 @@ class MigrationPlanner:
             else:
                 warnings.append(f"App action '{policy.app_action}' not found in WatchGuard config")
         
+        # =====================================================================
+        # Explicit zone mapping from policy aliases (v10)
+        # =====================================================================
+        source_zones: List[str] = []
+        dest_zones: List[str] = []
+        if self.alias_zone_mapper:
+            source_zones, src_unmapped = self.alias_zone_mapper.zones_for_aliases(
+                policy.source_aliases)
+            dest_zones, dst_unmapped = self.alias_zone_mapper.zones_for_aliases(
+                policy.destination_aliases)
+            # Only warn about unmapped aliases that also resolved to no
+            # address objects - those rules lose scoping entirely.
+            for alias in src_unmapped:
+                if alias not in self.address_objects and alias not in self.address_groups:
+                    warnings.append(
+                        f"Source alias '{alias}' has no zone mapping and no "
+                        f"address members - rule side will be unconstrained")
+            for alias in dst_unmapped:
+                if alias not in self.address_objects and alias not in self.address_groups:
+                    warnings.append(
+                        f"Destination alias '{alias}' has no zone mapping and no "
+                        f"address members - rule side will be unconstrained")
+
         # Check issues
         if not source_objects and policy.source_members and policy.source_members != ['Any']:
             issues.append(f"No source objects resolved from: {policy.source_members}")
@@ -804,6 +835,9 @@ class MigrationPlanner:
         return {
             'wg_policy': policy.name,
             'fmc_rule': fmc_rule,
+            # v10: zone NAMES (resolved to SecurityZone refs at execution)
+            'source_zones': source_zones,
+            'destination_zones': dest_zones,
             'issues': issues,
             'warnings': warnings,
             'errors': issues,
