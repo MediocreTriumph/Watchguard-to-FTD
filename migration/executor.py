@@ -313,6 +313,8 @@ class MigrationExecutor:
     
     def _save_reports(self):
         """Save migration report, including zone and user mapping info if available."""
+        # Zone application count (v10) - visible in the report summary
+        self.reporter.rules_with_zones = self.rules_with_zones
         # Add zone mapping report if available
         if self.zone_mapper:
             zone_report = self.zone_mapper.get_report()

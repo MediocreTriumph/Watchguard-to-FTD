@@ -323,6 +323,7 @@ class MigrationReporter:
             "rules_created": self._rules_created,
             "rules_with_warnings": self._rules_with_warnings,
             "rules_failed": self._rules_failed,
+            "rules_with_zones": getattr(self, 'rules_with_zones', 0),
             "objects_created": total_objects_created,
             "objects_skipped": total_objects_skipped,
             "objects_failed": total_objects_failed,
