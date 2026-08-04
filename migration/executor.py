@@ -1360,6 +1360,10 @@ class MigrationExecutor:
                         missing_elements.append('users')
                 elif warning['type'] == 'zone_mapping':
                     print(f"  ⚠ [{policy_name}] zone: {warning.get('message', 'Unknown')}")
+                    self.reporter.zone_warnings.append({
+                        'rule': policy_name,
+                        'message': warning.get('message', 'Unknown')
+                    })
                     continue
                 
                 if warning['type'] not in ['zone_mapping', 'unmapped_user']:

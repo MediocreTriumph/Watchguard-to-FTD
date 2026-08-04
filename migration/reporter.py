@@ -146,6 +146,14 @@ class MigrationReporter:
         self._interface_aliases_skipped: List[InterfaceAliasSkipped] = []
         self._groups_with_skipped_interfaces: List[GroupWithSkippedInterfaces] = []
         self.zone_mapping_report: Optional[Dict] = None
+
+        # Explicit zone tracking (v10)
+        self.rules_with_zones: int = 0
+        self.zone_warnings: List[Dict] = []
+
+        # Run correlation (v10) - stamped into the report so plan/report
+        # pairs from the same run can be matched unambiguously
+        self.run_id: Optional[str] = None
         
         # User mapping tracking (v7)
         self._unmapped_users: List[UnmappedUser] = []
@@ -316,6 +324,7 @@ class MigrationReporter:
         total_objects_failed = sum(self._objects_failed.values())
         
         summary = {
+            "run_id": self.run_id,
             "migration_started": self.start_time.isoformat(),
             "migration_completed": datetime.now().isoformat(),
             "duration_seconds": round((datetime.now() - self.start_time).total_seconds(), 2),
@@ -323,7 +332,7 @@ class MigrationReporter:
             "rules_created": self._rules_created,
             "rules_with_warnings": self._rules_with_warnings,
             "rules_failed": self._rules_failed,
-            "rules_with_zones": getattr(self, 'rules_with_zones', 0),
+            "rules_with_zones": self.rules_with_zones,
             "objects_created": total_objects_created,
             "objects_skipped": total_objects_skipped,
             "objects_failed": total_objects_failed,
@@ -370,6 +379,7 @@ class MigrationReporter:
     def get_warnings(self) -> Dict[str, List[Dict]]:
         """Get all warnings."""
         warnings = {
+            "zone_warnings": list(self.zone_warnings),
             "unmapped_applications": [
                 {"rule": w.rule, "application": w.application, 
                  "app_action": w.app_action, "reason": w.reason}

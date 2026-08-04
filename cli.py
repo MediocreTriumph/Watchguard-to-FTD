@@ -13,6 +13,25 @@ import json
 import getpass
 import argparse
 from pathlib import Path
+from datetime import datetime
+
+
+def new_run_id() -> str:
+    return datetime.now().strftime('%Y%m%d-%H%M%S')
+
+
+def print_artifact_manifest(run_id: str, files: list):
+    """Print exactly which files this run wrote, so stale copies from
+    earlier runs can't be mistaken for current output."""
+    print("\n" + "="*60)
+    print(f"RUN {run_id} ARTIFACTS")
+    print("="*60)
+    for f in files:
+        p = Path(f).resolve()
+        if p.exists():
+            mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime('%H:%M:%S')
+            print(f"  {p}  (written {mtime})")
+    print(f"\nVerify a file came from THIS run: grep {run_id} <file>")
 
 from config import MigrationConfig
 from models import WatchGuardConfig
@@ -314,10 +333,14 @@ def run_from_plan(config: MigrationConfig, plan_file: str,
     zone_resolver = _build_zone_resolver_if_needed(fmc_client, plan)
 
     print("\n⚠  This will create objects in FMC")
+    run_id = new_run_id()
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
                                  zone_mapper=zone_mapper, user_mapper=None,
                                  zone_resolver=zone_resolver)
-    return executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
+    executor.reporter.run_id = run_id
+    success = executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
+    print_artifact_manifest(run_id, ['migration_report.json'])
+    return success
 
 
 def run_migration(config: MigrationConfig, enable_zones: bool = False,
@@ -529,14 +552,17 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     if app_mapper and hasattr(app_mapper, 'get_report'):
         extra_reports['application_mapping'] = app_mapper.get_report()
 
+    run_id = new_run_id()
     planfile.save_plan(
         plan, plan_file,
         metadata={
+            'run_id': run_id,
             'source_config': config.watchguard_config_file,
             'fmc_host': config.fmc_host,
             'acp_name': config.new_acp_name,
             'use_existing_acp': use_existing_acp,
             'include_management': include_management,
+            'zone_mappings_file': zone_mappings_file,
         },
         extra_reports=extra_reports or None
     )
@@ -564,6 +590,7 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
         print("\nNo objects were created in FMC.")
         print("Review (and optionally edit) the migration plan, then either")
         print("re-run with --execute, or run: cli.py --from-plan migration_plan.json --execute")
+        print_artifact_manifest(run_id, [plan_file])
         return True
 
     # Step 9: Execute migration
@@ -581,8 +608,10 @@ def run_migration(config: MigrationConfig, enable_zones: bool = False,
     executor = MigrationExecutor(fmc_client, plan, fmc_discovery=fmc_objects,
                                   zone_mapper=zone_mapper, user_mapper=user_mapper,
                                   zone_resolver=zone_resolver)
+    executor.reporter.run_id = run_id
     success = executor.execute(config.new_acp_name, use_existing_acp=use_existing_acp)
 
+    print_artifact_manifest(run_id, [plan_file, 'migration_report.json'])
     return success
 
 
