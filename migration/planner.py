@@ -160,6 +160,14 @@ class MigrationPlanner:
                 self.wildcard_fqdns.add(fqdn.name)
         
         self.address_groups = {g.name: g for g in self.wg_config.address_groups}
+
+        # Full alias graph including interface aliases (v10.1). WatchGuard
+        # policies reference auto-generated per-policy aliases (e.g.
+        # 'Outgoing.1.from') that NEST the interface aliases (Any-Internal)
+        # as alias_references - zone mapping must see through that nesting.
+        self._alias_graph = dict(self.address_groups)
+        for alias in getattr(self.wg_config, 'interface_aliases', []):
+            self._alias_graph.setdefault(alias.name, alias)
         
         # =====================================================================
         # Service lookups (updated for v5 with service groups)
@@ -305,6 +313,27 @@ class MigrationPlanner:
         
         return list(set(resolved))
     
+    def _expand_alias_names(self, alias_name: str,
+                            visited: Optional[Set[str]] = None) -> List[str]:
+        """Return alias_name plus every alias transitively referenced by it.
+
+        WatchGuard policies point at per-policy aliases like 'Outgoing.1.from'
+        whose alias_references contain the actual interface aliases
+        (Any-Internal, Any-External). Zone mapping needs the full set.
+        """
+        if visited is None:
+            visited = set()
+        if alias_name in visited:
+            return []
+        visited.add(alias_name)
+
+        names = [alias_name]
+        group = self._alias_graph.get(alias_name)
+        if group:
+            for ref in group.alias_references:
+                names.extend(self._expand_alias_names(ref, visited))
+        return names
+
     def resolve_service(self, service_name: str) -> Dict[str, Any]:
         """
         Resolve a WatchGuard service name to either a service group or individual service.
@@ -731,10 +760,19 @@ class MigrationPlanner:
         source_zones: List[str] = []
         dest_zones: List[str] = []
         if self.alias_zone_mapper:
+            # Expand per-policy aliases through their references so the
+            # mapper sees nested interface aliases (v10.1)
+            expanded_src: List[str] = []
+            for alias in policy.source_aliases or []:
+                expanded_src.extend(self._expand_alias_names(alias))
+            expanded_dst: List[str] = []
+            for alias in policy.destination_aliases or []:
+                expanded_dst.extend(self._expand_alias_names(alias))
+
             source_zones, src_unmapped = self.alias_zone_mapper.zones_for_aliases(
-                policy.source_aliases)
+                expanded_src)
             dest_zones, dst_unmapped = self.alias_zone_mapper.zones_for_aliases(
-                policy.destination_aliases)
+                expanded_dst)
             # Only warn about unmapped aliases that also resolved to no
             # address objects - those rules lose scoping entirely.
             for alias in src_unmapped:

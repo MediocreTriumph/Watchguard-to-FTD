@@ -4,7 +4,7 @@ __pycache__/
 
 # Generated outputs
 migration_plan*.json
-migration_report.json
+migration_report*.json
 policy_audit_report*.json
 watchguard_config_v5_*.json
 watchguard_config_v5_*.xlsx

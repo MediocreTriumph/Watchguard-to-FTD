@@ -133,6 +133,76 @@ def test_planner_without_mapper_has_empty_zones():
         assert p["destination_zones"] == []
 
 
+def test_planner_expands_nested_aliases(tmp_path):
+    """Real WatchGuard structure: policies reference per-policy aliases
+    ('Outgoing.1.from') that nest interface aliases as alias_references.
+    Zone mapping must see through the nesting - regression for the bug
+    where every policy planned with zero zones."""
+    f = tmp_path / "zone_mappings.json"
+    f.write_text(json.dumps({"mappings": {
+        "Any-Internal": "INSIDE",
+        "Any-External": "OUTSIDE",
+        "Any-Guest": "GUEST",
+    }}))
+
+    wg = WatchGuardConfig.from_json({
+        "address_groups": [
+            {"name": "Outgoing.1.from", "alias_references": ["Any-Internal"]},
+            {"name": "Outgoing.1.to", "alias_references": ["Any-External"]},
+            {"name": "Guest.1.from", "alias_references": ["Any-Guest"]},
+        ],
+        "interface_aliases": [
+            {"name": "Any-Internal", "member_interfaces": ["eth1"]},
+            {"name": "Any-External", "member_interfaces": ["eth0"]},
+            {"name": "Any-Guest", "member_interfaces": ["eth2"]},
+        ],
+        "policies": [
+            {"name": "Outgoing", "source_members": [], "destination_members": [],
+             "service": "Any", "action": "Allow", "enabled": "true",
+             "source_aliases": ["Outgoing.1.from"],
+             "destination_aliases": ["Outgoing.1.to"]},
+            {"name": "Guest", "source_members": [], "destination_members": [],
+             "service": "Any", "action": "Allow", "enabled": "true",
+             "source_aliases": ["Guest.1.from"],
+             "destination_aliases": ["Any"]},
+        ],
+    })
+    planner = MigrationPlanner(wg, fmc_discovery=None, service_mapper=object(),
+                               app_mapper=object(),
+                               alias_zone_mapper=AliasZoneMapper(str(f)))
+    plan = planner.build_plan()
+    by_name = {p['wg_policy']: p for p in plan.policies_to_create}
+    assert by_name["Outgoing"]["source_zones"] == ["INSIDE"]
+    assert by_name["Outgoing"]["destination_zones"] == ["OUTSIDE"]
+    assert by_name["Guest"]["source_zones"] == ["GUEST"]
+    assert by_name["Guest"]["destination_zones"] == []
+    assert plan.statistics["policies_with_zones"] == 2
+
+
+def test_alias_expansion_handles_cycles(tmp_path):
+    f = tmp_path / "zone_mappings.json"
+    f.write_text(json.dumps({"mappings": {"Any-Internal": "INSIDE"}}))
+    wg = WatchGuardConfig.from_json({
+        "address_groups": [
+            {"name": "A", "alias_references": ["B"]},
+            {"name": "B", "alias_references": ["A", "Any-Internal"]},
+        ],
+        "interface_aliases": [
+            {"name": "Any-Internal", "member_interfaces": ["eth1"]},
+        ],
+        "policies": [
+            {"name": "Loopy", "source_members": [], "destination_members": [],
+             "service": "Any", "action": "Allow", "enabled": "true",
+             "source_aliases": ["A"], "destination_aliases": []},
+        ],
+    })
+    planner = MigrationPlanner(wg, fmc_discovery=None, service_mapper=object(),
+                               app_mapper=object(),
+                               alias_zone_mapper=AliasZoneMapper(str(f)))
+    plan = planner.build_plan()
+    assert plan.policies_to_create[0]["source_zones"] == ["INSIDE"]
+
+
 # ---------------------------------------------------------------- executor
 
 def make_executor():
